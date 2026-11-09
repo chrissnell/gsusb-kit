@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcuserdatad
+xcuserdata/
+DerivedData/
+.claude/
+scratch/

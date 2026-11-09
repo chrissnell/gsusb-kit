@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Report versions
+        run: swift --version
+
+      # IOUSBHostTransport is the one source file no test executes -- it needs
+      # an adapter plugged into the machine. Linking the probe is therefore the
+      # only thing standing between it and silent bit-rot, so it runs before
+      # the tests rather than after.
+      - name: Build gsusbprobe (links IOUSBHostTransport)
+        run: swift build --product gsusbprobe
+
+      - name: Test
+        run: swift test
