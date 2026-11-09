@@ -1048,6 +1048,25 @@ public actor GsUsbDevice {
                 let flags = GsHostFrameFlags(
                     rawValue: buffer[offset + GsHostFrame.flagsByteOffset]
                 )
+                // A classical connection never asked for `GS_CAN_MODE_FD`, so
+                // the controller cannot have received a CAN FD frame: the bit
+                // set here is one corrupt byte or a firmware fault, not an
+                // 80-byte frame. Believing it would consume the real frames
+                // behind it in the same transfer as payload — four 24-byte
+                // frames become one 80-byte "frame" and sixteen trailing
+                // bytes, so three of them vanish without being counted. The
+                // flag is refused instead and the fixed classical stride, which
+                // is the only stride this connection can produce, carries the
+                // walk to the next frame.
+                if flags.contains(.canFD), !options.canFD {
+                    let classical = GsHostFrame.Layout(
+                        canFD: false, timestamped: framesAreTimestamped
+                    )
+                    guard offset + classical.byteCount <= buffer.count else { break }
+                    offset += classical.byteCount
+                    statistics.decodeFailures += 1
+                    continue
+                }
                 let layout = GsHostFrame.Layout(
                     canFD: flags.contains(.canFD), timestamped: framesAreTimestamped
                 )

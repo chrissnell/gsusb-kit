@@ -1402,6 +1402,49 @@ private func transmittingTransport(
     #expect(second?.timestampNs != third?.timestampNs)
 }
 
+/// On a classical connection a set `GS_CAN_FLAG_FD` is a corrupt byte, not an
+/// 80-byte frame, and sizing the frame from it would eat the real frames
+/// behind it. One flipped bit in the first of four frames costs that frame and
+/// nothing else.
+@Test func aSpuriousFdFlagOnAClassicalConnectionCostsOnlyItsOwnFrame() async throws {
+    var buffer = [0x100, 0x200, 0x300, 0x400].enumerated().flatMap { index, id in
+        hostFrameBytes(
+            rawCanID: UInt32(id),
+            data: [0x01, 0x02],
+            timestampMicroseconds: UInt32(10 * (index + 1))
+        )
+    }
+    // The single bit the firmware never sets on this connection. Everything
+    // else in the buffer is four well-formed 24-byte classical frames — the
+    // stride this connection has, because `shC30xFeatures` reports
+    // `GS_CAN_FEATURE_HW_TIMESTAMP` and the default options ask for it.
+    buffer[GsHostFrame.flagsByteOffset] |= GsHostFrameFlags.canFD.rawValue
+
+    let transport = ScriptedUsbTransport(sessions: [
+        session(features: shC30xFeatures, bulkReads: [.payload(buffer)]),
+    ])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(transport, consumer: collector)
+    var iterator = collector.frames.makeAsyncIterator()
+
+    await device.start()
+    let first = await iterator.next()
+    let second = await iterator.next()
+    let third = await iterator.next()
+    await device.stop()
+
+    // Believing the flag would have consumed 0x200 and 0x300 as payload and
+    // published 0x100 as a 2-byte CAN FD frame.
+    #expect(first?.canID == 0x200)
+    #expect(second?.canID == 0x300)
+    #expect(third?.canID == 0x400)
+    #expect(first?.fd == false)
+
+    let statistics = await device.currentStatistics()
+    #expect(statistics.framesReceived == 3)
+    #expect(statistics.decodeFailures == 1)
+}
+
 /// A CAN FD frame whose header says 80 bytes and whose buffer holds fewer is
 /// counted, not guessed at. The frames ahead of it in the buffer were each
 /// described by their own header and still stand.
