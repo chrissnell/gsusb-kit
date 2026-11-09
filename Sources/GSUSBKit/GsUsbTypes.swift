@@ -7,8 +7,13 @@ import Foundation
 
 // MARK: - Frames
 
-/// One classical CAN frame the adapter delivered, already decoded and
-/// timestamped.
+/// One CAN frame the adapter delivered, already decoded and timestamped.
+///
+/// Classical and CAN FD frames arrive through this one type, with `fd` saying
+/// which. They are not separated because a CAN FD bus carries both — a
+/// classical frame on an FD link is an ordinary thing to see, and splitting
+/// the stream in two would make a recording's interleaving something the host
+/// had to reassemble.
 ///
 /// `timestampNs` is `CLOCK_REALTIME` nanoseconds since the Unix epoch, mapped
 /// from whichever of the two sources the connection negotiated: the adapter's
@@ -31,6 +36,18 @@ public struct GsUsbFrame: Sendable, Equatable {
     /// gs_usb delivers CAN error frames as host frames with the error flag
     /// set, so they arrive here rather than through a separate channel.
     public var err: Bool
+    /// A CAN FD frame: `data` may be up to 64 bytes, and only the lengths CAN
+    /// FD can express appear (0–8, 12, 16, 20, 24, 32, 48, 64).
+    public var fd: Bool
+    /// The data phase ran at the connection's data bitrate rather than at the
+    /// arbitration rate. Only ever true on a CAN FD frame, and recorded
+    /// separately from `fd` because the two are genuinely different frames on
+    /// the wire — a 64-byte frame sent entirely at 500 kbit/s is legal.
+    public var bitRateSwitch: Bool
+    /// The *transmitting* node was error-passive. Set by that node's
+    /// controller, so this is information about some other device on the bus
+    /// and not about this adapter.
+    public var errorStateIndicator: Bool
     public var data: [UInt8]
     /// True when this host transmitted the frame and the adapter echoed it
     /// back, rather than it having been observed from another node. A
@@ -46,6 +63,9 @@ public struct GsUsbFrame: Sendable, Equatable {
     /// it has already been handed.
     public var sourceDescription: String
 
+    /// The three CAN FD flags default to `false`, so a host that only ever
+    /// builds classical frames — a test fixture, a replay of a pre-FD capture
+    /// — constructs one exactly as it always did.
     public init(
         timestampNs: Int64,
         seq: UInt64,
@@ -53,6 +73,9 @@ public struct GsUsbFrame: Sendable, Equatable {
         extended: Bool,
         rtr: Bool,
         err: Bool,
+        fd: Bool = false,
+        bitRateSwitch: Bool = false,
+        errorStateIndicator: Bool = false,
         data: [UInt8],
         tx: Bool,
         sourceDescription: String
@@ -63,6 +86,9 @@ public struct GsUsbFrame: Sendable, Equatable {
         self.extended = extended
         self.rtr = rtr
         self.err = err
+        self.fd = fd
+        self.bitRateSwitch = bitRateSwitch
+        self.errorStateIndicator = errorStateIndicator
         self.data = data
         self.tx = tx
         self.sourceDescription = sourceDescription
@@ -78,12 +104,35 @@ public struct GsUsbOutboundFrame: Sendable, Equatable {
     public var canID: UInt32
     public var extended: Bool
     public var rtr: Bool
+    /// Send this as a CAN FD frame. Requires a connection opened with
+    /// `GsUsbOptions.FrameFormat.canFD`; `send` throws
+    /// `GsUsbTransmitError.canFDNotEnabled` otherwise rather than downgrading
+    /// the frame to classical and putting a different frame on the bus.
+    public var fd: Bool
+    /// Run the data phase at the data bitrate. CAN FD only, and not implied by
+    /// `fd`: an FD frame without it is sent entirely at the arbitration rate,
+    /// which is what you want on a link whose other nodes cannot switch.
+    public var bitRateSwitch: Bool
+    /// At most 8 bytes classical; on a CAN FD frame, one of the lengths CAN FD
+    /// can express — 0–8, 12, 16, 20, 24, 32, 48 or 64.
     public var data: [UInt8]
 
-    public init(canID: UInt32, extended: Bool = false, rtr: Bool = false, data: [UInt8] = []) {
+    /// `errorStateIndicator` has no outbound counterpart on purpose — the
+    /// controller sets ESI from its own error state, so a host-supplied value
+    /// would be a field that looks settable and is not.
+    public init(
+        canID: UInt32,
+        extended: Bool = false,
+        rtr: Bool = false,
+        fd: Bool = false,
+        bitRateSwitch: Bool = false,
+        data: [UInt8] = []
+    ) {
         self.canID = canID
         self.extended = extended
         self.rtr = rtr
+        self.fd = fd
+        self.bitRateSwitch = bitRateSwitch
         self.data = data
     }
 }
@@ -161,8 +210,10 @@ public struct GsUsbStatistics: Sendable, Equatable {
     /// Frames this host put on the wire and the adapter confirmed by echo.
     /// Stays zero on a listen-only connection, which cannot have one.
     public var framesTransmitted: UInt64 = 0
-    /// Bulk-IN bytes that would not decode as `gs_host_frame`: a buffer that
-    /// is not a whole number of frames, or a frame with an impossible DLC.
+    /// Bulk-IN bytes that would not decode as `gs_host_frame`: a trailing
+    /// fragment too short to be the frame its header describes, or a frame
+    /// with an impossible DLC. Counted once per undecodable region, not per
+    /// byte.
     public var decodeFailures: UInt64 = 0
     /// Frames the driver knows it never saw, where the loss happened below it —
     /// the adapter reporting its receive FIFO overflowed. Since `seq` is
