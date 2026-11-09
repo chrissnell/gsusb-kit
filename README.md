@@ -10,8 +10,8 @@ runs against a live vehicle bus.
 
 `gs_usb` is the USB protocol spoken by the
 [candleLight](https://github.com/candle-usb/candleLight_fw) firmware, and the
-one Linux's `gs_usb` kernel module drives. It's why the differently-branded
-dongles below are interchangeable: same firmware, different sticker.
+one Linux's `gs_usb` kernel module drives. It's why so many differently-branded
+dongles are interchangeable: same firmware, different sticker.
 
 macOS ships nothing equivalent — no SocketCAN, no module, no `can0`. So on a
 Mac you talk to the adapter yourself, over raw USB. That's what this is. It
@@ -26,25 +26,23 @@ and no separate configuration tool.
 
 ## Adapters
 
-| Adapter | Status |
-|---|---|
-| DSD TECH SH-C30A | Tested — this is what development ran against |
-| DSD TECH SH-C31A | Same firmware, should be identical |
-| CANable / CANable 2.0 | Expected to work, flashed with candleLight firmware (not the stock slcan firmware) |
-| candleLight | Expected to work |
-| CANtact / CANtact Pro | Expected to work |
-| budgetcan | Expected to work |
+Whatever candleLight supports, with one exception below. Their
+[hardware list](https://github.com/candle-usb/candleLight_fw#candlelight_gsusb)
+is the authoritative one, so there's no second copy of it here.
 
-Only the SH-C30A has actually been on the end of a cable here. The rest run the
-same firmware and should behave the same, but I haven't verified them — if you
-try one, let me know how it goes.
+Development ran against a DSD TECH SH-C30A, and that's the only one that's been
+on the end of a cable here. The rest run the same firmware and should behave the
+same; if you try one, let me know how it goes.
 
-Got an adapter that isn't listed? Open System Information → USB. If it shows up
-with vendor ID `0x1D50` and product ID `0x606F`, it's running candleLight
-firmware and this library will drive it.
+Already own something and not sure? Open System Information → USB. Vendor ID
+`0x1D50` with product ID `0x606F` means candleLight firmware, and this library
+will drive it.
 
-**Classical CAN only.** No CAN FD, and no multi-channel adapters. Both are
-refused during the connect handshake rather than half-configured and hoped for.
+**Classical CAN only — that's the exception.** An adapter that reports the CAN
+FD feature bit is refused during the handshake, before anything is configured.
+So the FD-capable boards on candleLight's list won't connect at all, not even
+for classical traffic. Single channel only, too: a frame arriving on any channel
+but the first is an error rather than something quietly folded in with the rest.
 
 ## Requirements
 
