@@ -1,25 +1,28 @@
 # GSUSBKit
 
-Talk to a CAN bus from your Mac in Swift, using a cheap USB adapter and no
-kernel extension.
+A Swift driver for gs_usb CAN adapters on macOS. No kernel extension, no
+entitlement, no SocketCAN.
 
 Pulled out of [canopener](https://github.com/chrissnell/canopener), where it
 runs against a live vehicle bus.
 
-## If you've never touched CAN before
+## What gs_usb is, if you've only met it as a Linux module
 
-CAN is the network inside your car. Also most motorcycles, boats, tractors and
-factory equipment. It's two wires, and everything on it — engine controller,
-dashboard, ABS — broadcasts short messages called *frames*. A frame is an ID
-(up to 29 bits, says what the message is) plus up to 8 bytes of data. There's
-no addressing and no master. Everyone shouts, everyone hears everything.
+`gs_usb` is the USB protocol spoken by the
+[candleLight](https://github.com/candle-usb/candleLight_fw) firmware, and the
+one Linux's `gs_usb` kernel module drives. It's why the differently-branded
+dongles below are interchangeable: same firmware, different sticker.
 
-The adapters below are small USB dongles that bridge that bus to your Mac. They
-all speak the same open USB protocol, `gs_usb`, which comes from the
-[candleLight](https://github.com/candle-usb/candleLight_fw) firmware project —
-that's why a handful of differently-branded dongles are interchangeable here.
+macOS ships nothing equivalent — no SocketCAN, no module, no `can0`. So on a
+Mac you talk to the adapter yourself, over raw USB. That's what this is. It
+claims the vendor interface through `IOUSBHost`, runs the gs_usb handshake
+(`HOST_FORMAT` → `BT_CONST` → `BITTIMING` → `MODE`), and hands you decoded,
+timestamped frames. It reconnects on its own, polls controller error state, and
+corrects for the adapter's crystal drift over long captures.
 
-This library handles the USB side and hands you decoded, timestamped frames.
+Frames arrive through a callback rather than a `can0` socket, and the bit rate
+is negotiated for you from a plain `bitrate:` — there's no `ip link set` step
+and no separate configuration tool.
 
 ## Adapters
 
@@ -40,8 +43,7 @@ Got an adapter that isn't listed? Open System Information → USB. If it shows u
 with vendor ID `0x1D50` and product ID `0x606F`, it's running candleLight
 firmware and this library will drive it.
 
-**Classical CAN only.** CAN FD — the faster, 64-byte-payload successor — isn't
-supported, and neither are adapters with more than one CAN port. Both are
+**Classical CAN only.** No CAN FD, and no multi-channel adapters. Both are
 refused during the connect handshake rather than half-configured and hoped for.
 
 ## Requirements
@@ -95,23 +97,14 @@ await device.stop()
 
 ## It can't transmit unless you ask it to
 
-By default this library sets the adapter up so it is *physically incapable* of
-affecting the bus. That's worth explaining, because it's not just a safety flag
-somebody added.
+`GsUsbOptions` defaults to `busAccess: .listenOnly`, which sets
+`GS_CAN_FEATURE_LISTEN_ONLY` — the controller holds TX recessive, ACKs nothing,
+raises no error frames and never retransmits.
 
-On CAN, acknowledgement is part of the wire protocol. Every controller that
-hears a valid frame yanks the bus low to say "got it" — that's not optional
-politeness, it's how the protocol works. And if a controller doesn't like what
-it sees, it transmits an error flag that deliberately corrupts that frame for
-*everyone* on the bus. So a CAN adapter that comes up in normal mode is already
-participating the instant you plug it in. On a car that's actually running,
-that's a real way to cause trouble.
-
-Listen-only mode puts the controller in a state where it never drives the wires
-at all. No acknowledgements, no error frames, no retransmissions. You see
-everything; the bus can't see you.
-
-That's the default:
+The default is deliberate, because the alternative isn't passive. An adapter
+started as a normal node is a full participant from the first frame it hears —
+ACKing traffic and flagging errors on a bus that may be in a moving vehicle.
+Going live should be something you typed on purpose:
 
 ```swift
 GsUsbOptions(bitrate: 500_000)              // listen-only, silent
