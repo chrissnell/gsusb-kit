@@ -14,6 +14,11 @@ dashboard, ABS — broadcasts short messages called *frames*. A frame is an ID
 (up to 29 bits, says what the message is) plus up to 8 bytes of data. There's
 no addressing and no master. Everyone shouts, everyone hears everything.
 
+Newer vehicles also run **CAN FD**, which is the same two wires with a bigger
+frame — up to 64 bytes — and an optional trick where the payload is clocked
+out faster than the part of the frame that arbitrates for the bus. This library
+handles both.
+
 The adapters below are small USB dongles that bridge that bus to your Mac. They
 all speak the same open USB protocol, `gs_usb`, which comes from the
 [candleLight](https://github.com/candle-usb/candleLight_fw) firmware project —
@@ -23,26 +28,34 @@ This library handles the USB side and hands you decoded, timestamped frames.
 
 ## Adapters
 
-| Adapter | Status |
-|---|---|
-| DSD TECH SH-C30A | Tested — this is what development ran against |
-| DSD TECH SH-C31A | Same firmware, should be identical |
-| CANable / CANable 2.0 | Expected to work, flashed with candleLight firmware (not the stock slcan firmware) |
-| candleLight | Expected to work |
-| CANtact / CANtact Pro | Expected to work |
-| budgetcan | Expected to work |
+| Adapter | CAN | CAN FD | Status |
+|---|---|---|---|
+| DSD TECH SH-C30A | ✓ | — | Tested — this is what development ran against |
+| DSD TECH SH-C31A | ✓ | — | Same firmware, should be identical |
+| CANable | ✓ | — | Expected to work, flashed with candleLight firmware (not the stock slcan firmware) |
+| CANable 2.0 | ✓ | ✓ | Expected to work, candleLight firmware built with CAN FD |
+| candleLight | ✓ | — | Expected to work |
+| CANtact | ✓ | — | Expected to work |
+| CANtact Pro | ✓ | see below | Classical expected to work |
+| budgetcan | ✓ | ✓ | Expected to work |
 
-Only the SH-C30A has actually been on the end of a cable here. The rest run the
-same firmware and should behave the same, but I haven't verified them — if you
-try one, let me know how it goes.
+Only the SH-C30A has actually been on the end of a cable here, and it is a
+classical-CAN adapter — so the CAN FD path is built from the protocol
+definitions and tested against a scripted device, not against FD hardware. If
+you run it on a real FD adapter, I'd like to hear how it goes.
 
 Got an adapter that isn't listed? Open System Information → USB. If it shows up
 with vendor ID `0x1D50` and product ID `0x606F`, it's running candleLight
-firmware and this library will drive it.
+firmware and this library will drive it. Whether that particular build has CAN
+FD compiled in is a separate question, and `swift run gsusbprobe` answers it.
 
-**Classical CAN only.** CAN FD — the faster, 64-byte-payload successor — isn't
-supported, and neither are adapters with more than one CAN port. Both are
-refused during the connect handshake rather than half-configured and hoped for.
+**Not supported:** adapters with more than one CAN port, and the padding
+workaround some LPC546xx-based adapters need (`GS_CAN_FEATURE_REQ_USB_QUIRK_LPC546XX`).
+The CANtact Pro is an LPC546xx board, and its original firmware also moves the
+data-bitrate request to a different `bRequest` than candleLight uses, so CAN FD
+on a CANtact Pro running firmware v2 or earlier will not work. Multi-port
+adapters are refused during the connect handshake rather than half-configured
+and hoped for; the quirk is simply not implemented.
 
 ## Requirements
 
@@ -82,8 +95,9 @@ Task { for await notice in device.notices { print(notice.label) } }
 await device.start()
 ```
 
-500 kbit/s is the common vehicle rate and the default. The device finds the
-adapter, connects, and reconnects by itself if the cable is pulled.
+500 kbit/s is the common vehicle rate and the default, and a plain `bitrate:`
+gives you classical CAN. The device finds the adapter, connects, and reconnects
+by itself if the cable is pulled.
 
 **Call `stop()` when you're done.** A running device's background task holds a
 strong reference to it, so just dropping your reference doesn't shut it down —
@@ -131,6 +145,53 @@ A few consequences:
 - The mode is re-applied on every reconnect, so a cable bounce can't bring the
   adapter back up live.
 
+## CAN FD
+
+CAN FD is off unless you ask for it, and asking for it means naming the second
+bitrate:
+
+```swift
+GsUsbOptions(bitrate: 500_000, frameFormat: .canFD(dataBitrate: 2_000_000))
+```
+
+Two rates, because a CAN FD frame is clocked at two different speeds. The ID
+and the arbitration run at `bitrate`, same as classical CAN, because that part
+has to be slow enough for every node on the wire to resolve a collision. Then,
+if the frame says so, the payload and CRC switch to `dataBitrate` and the
+frame finishes faster than its header. 500 kbit/s arbitration with 2 Mbit/s
+data is the usual automotive pair.
+
+The data bitrate is a second, independent bit-timing solution against limits
+the adapter reports separately (`BREQ_BT_CONST_EXT`), so it gets the same
+treatment `bitrate` does: solved exactly, and refused if the closest the
+hardware can reach is more than 0.5% off. `swift run gsusbprobe` prints which
+data rates a given adapter can actually hit.
+
+**Both refusals happen before anything is configured.** An adapter that
+doesn't report `GS_CAN_FEATURE_FD` is refused rather than brought up classical,
+because a silently-classical link would drop every FD frame on the bus while
+reporting a healthy connection. An adapter that reports FD but won't report its
+data-phase timing limits is refused too — there's no honest way to solve a data
+bitrate without them, and guessing would configure a rate different from the
+one you asked for.
+
+Being FD-capable is not a reason to refuse an adapter. An FD adapter opened
+without `frameFormat:` runs classical, which is also what the hardware does
+when the FD mode bit is absent.
+
+### Frames on an FD link
+
+Classical and CAN FD frames arrive through the same `GsUsbFrame`, because an FD
+bus carries both and splitting the stream would make the interleaving something
+you had to reassemble. Three flags tell them apart:
+
+- `fd` — a CAN FD frame. `data` can be up to 64 bytes.
+- `bitRateSwitch` — the payload really did run at `dataBitrate`. Not implied by
+  `fd`: a 64-byte frame sent entirely at the arbitration rate is legal, and the
+  two are different frames on the wire.
+- `errorStateIndicator` — the node that *sent* this frame was error-passive.
+  That's information about somebody else's controller, not about your adapter.
+
 ## Sending frames
 
 Once you're bus-active:
@@ -138,6 +199,29 @@ Once you're bus-active:
 ```swift
 try await device.send(GsUsbOutboundFrame(canID: 0x123, data: [0x01, 0x02]))
 ```
+
+On a CAN FD connection, say which kind of frame you want:
+
+```swift
+try await device.send(GsUsbOutboundFrame(
+    canID: 0x123, fd: true, bitRateSwitch: true, data: sixtyFourBytes
+))
+```
+
+A classical frame on an FD connection stays a classical frame, on the wire and
+in the recording. An FD frame on a *classical* connection throws
+`GsUsbTransmitError.canFDNotEnabled` — it will not quietly truncate 64 bytes
+into 8, for the same reason a listen-only connection won't quietly reconfigure
+itself to honour a `send`.
+
+**CAN FD payload lengths are not contiguous.** Past 8 bytes the only lengths
+that exist are 12, 16, 20, 24, 32, 48 and 64. A 9-byte payload is refused
+rather than padded up to 12: on a bus you're reverse-engineering, three bytes
+nobody chose are three bytes nobody can interpret. Pad it yourself and you know
+what went out.
+
+`rtr` and `fd` together are refused as well. CAN FD has no remote-request
+frame — the bit position RTR used to occupy is reserved and has to be dominant.
 
 ## How frames get to you
 
@@ -163,9 +247,10 @@ One rule: `consume` is awaited by the read loop, so whatever you do in there
 holds up reading. Append to a buffer and return. Don't do real work inside it.
 
 Frames arrive with the flag bits already sorted out — `canID` is the plain ID,
-with `extended`, `rtr` and `err` as separate properties. `tx` tells you whether
-a frame is one you sent (echoed back) or one you observed from another device
-on the bus, so a recording never confuses your own injection with a reply.
+with `extended`, `rtr`, `err`, `fd`, `bitRateSwitch` and `errorStateIndicator`
+as separate properties. `tx` tells you whether a frame is one you sent (echoed
+back) or one you observed from another device on the bus, so a recording never
+confuses your own injection with a reply.
 
 ## Timestamps
 
@@ -228,6 +313,12 @@ swift run gsusbprobe
 Prints what's plugged in: identity, feature bits, bit-timing limits. Good first
 thing to run when an adapter isn't behaving, or to check whether an unlisted
 one is supported.
+
+On an adapter that reports CAN FD it also prints the data-phase timing limits
+and works through a handful of common data bitrates, saying for each one
+whether this adapter can reach it inside the 0.5% ceiling. "Supports CAN FD"
+and "can run 5 Mbit/s" are different claims, and this is how you tell them
+apart before wiring anything up.
 
 It's strictly read-only — never sets a mode, never writes to the bus, never
 leaves the adapter in a state that outlives it. It also exists for a second

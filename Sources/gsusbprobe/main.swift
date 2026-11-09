@@ -5,10 +5,11 @@ import GSUSBKit
 // `IOUSBHostTransport` gets executed — no test on any machine can reach that
 // file, so this executable is the verification step that replaces one.
 //
-// It answers four questions a human needs answered before phase 5 can be
+// It answers five questions a human needs answered before phase 5 can be
 // written, and it answers them by doing the least that can produce an answer:
-// enumerate, open, two control reads, print, close. It never sets a mode, never
-// writes to the bus, and never puts the adapter into a state that outlives it.
+// enumerate, open, a few control reads, print, close. It never sets a mode,
+// never writes to the bus, and never puts the adapter into a state that
+// outlives it.
 //
 //   1. Does an unentitled, hardened-runtime process get an `IOUSBHostInterface`
 //      open? That is the §3.1 go/no-go; a failure here sends the project to
@@ -19,6 +20,10 @@ import GSUSBKit
 //   4. What are `fclk_can` and the segment limits? Phase 7 computes bit timing
 //      from exactly those numbers, and guessing them is how you get an adapter
 //      that joins the bus and corrupts every frame on it.
+//   5. Is CAN FD usable — `GS_CAN_FEATURE_FD` *and* `GS_CAN_FEATURE_BT_CONST_EXT`
+//      — and which data bitrates can this adapter's data-phase limits actually
+//      reach inside the 0.5% ceiling? Being FD-capable and being able to run
+//      2 Mbit/s are different claims.
 
 // MARK: - Output helpers
 
@@ -66,6 +71,22 @@ let featureBits: [(GsCanFeature, String)] = [
     (.berrReporting, "BERR_REPORTING"),
     (.getState, "GET_STATE"),
 ]
+
+/// CAN FD needs two bits, not one: the feature itself, and the extended
+/// bit-timing constants without which the data phase cannot be solved. A
+/// device with only the first is refused by `GsUsbDevice`, so saying so here
+/// is the difference between a puzzling refusal and an explained one.
+func canFDVerdict(_ feature: GsCanFeature) -> String {
+    switch (feature.contains(.canFD), feature.contains(.btConstExt)) {
+    case (true, true):
+        return "present — CAN FD usable, data bitrate configurable"
+    case (true, false):
+        return "present but BT_CONST_EXT is absent — CAN FD will be refused, "
+            + "the data phase cannot be solved"
+    case (false, _):
+        return "absent — classical CAN only"
+    }
+}
 
 // MARK: - Probe
 
@@ -185,6 +206,57 @@ func probe() async -> Int32 {
         field("BT_CONST_EXT", constants.feature.contains(.btConstExt)
             ? "present — data bit timing readable"
             : "absent")
+        field("FD", canFDVerdict(constants.feature))
+
+        // The data phase's own limits, which is what a CAN FD connection's
+        // second bit-timing solution is computed from. Only asked for when the
+        // device says both bits, exactly as the driver does — asking otherwise
+        // earns a stall, and this tool is here to answer questions, not to
+        // provoke them.
+        if constants.feature.contains(.canFD), constants.feature.contains(.btConstExt) {
+            heading("GET_BT_CONST_EXT (bRequest \(GsUsbBreq.btConstExt.rawValue), channel 0)")
+            do {
+                let bytes = try await transport.controlTransfer(
+                    .vendorInterfaceIn(
+                        request: GsUsbBreq.btConstExt.rawValue,
+                        value: 0,
+                        interface: info.interfaceNumber,
+                        length: GsDeviceBtConstExtended.byteCount
+                    ),
+                    payload: []
+                )
+                let extended = try GsDeviceBtConstExtended(decoding: bytes)
+                let data = extended.dataPhase
+
+                print("  Data-phase timing (one fclk_can, its own segments):")
+                field("dtseg1", "\(data.tseg1Min) … \(data.tseg1Max)")
+                field("dtseg2", "\(data.tseg2Min) … \(data.tseg2Max)")
+                field("dsjw_max", "\(data.sjwMax)")
+                field("dbrp", "\(data.brpMin) … \(data.brpMax) step \(data.brpInc)")
+
+                print("")
+                print("  Reachable data bitrates (0.5% ceiling, as the driver solves them):")
+                for bitrate in [1_000_000, 2_000_000, 4_000_000, 5_000_000, 8_000_000] {
+                    let rate = UInt32(bitrate)
+                    do {
+                        let solved = try BitTiming.solve(bitrate: rate, constants: data)
+                        field(
+                            "\(rate) bit/s",
+                            "prop_seg \(solved.bittiming.propSeg), "
+                                + "phase_seg1 \(solved.bittiming.phaseSeg1), "
+                                + "phase_seg2 \(solved.bittiming.phaseSeg2), "
+                                + "brp \(solved.bittiming.brp), "
+                                + "sample point \(solved.samplePoint / 10).\(solved.samplePoint % 10)%"
+                        )
+                    } catch {
+                        field("\(rate) bit/s", "unreachable — \(error)")
+                    }
+                }
+            } catch {
+                print("  FAILED: \(error)")
+                status = 3
+            }
+        }
     } catch {
         print("  FAILED: \(error)")
         status = 3

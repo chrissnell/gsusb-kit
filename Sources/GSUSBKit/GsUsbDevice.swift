@@ -24,8 +24,38 @@ public struct GsUsbOptions: Sendable, Equatable {
         case busActive
     }
 
+    /// Classical CAN, or CAN FD with the rate its data phase runs at.
+    ///
+    /// An enum with the data bitrate *inside* the CAN FD case, rather than a
+    /// `canFD: Bool` beside an optional `dataBitrate`, because those two
+    /// spellings admit two states that do not exist: CAN FD with no data rate
+    /// to switch to, and a data rate on a link that will never leave the
+    /// arbitration phase. Neither can be constructed here.
+    ///
+    /// The data bitrate is a second, independent bit-timing solution against
+    /// the device's data-phase limits (`BREQ_BT_CONST_EXT`), so it is subject
+    /// to the same 0.5% ceiling as `bitrate` and refused the same way.
+    public enum FrameFormat: Sendable, Equatable {
+        case classical
+        /// `dataBitrate` is the rate the payload and CRC run at once the
+        /// bit-rate switch happens — 2 Mbit/s is the common automotive choice.
+        case canFD(dataBitrate: UInt32)
+
+        public var isCanFD: Bool { self != .classical }
+
+        public var dataBitrate: UInt32? {
+            if case let .canFD(dataBitrate) = self { return dataBitrate }
+            return nil
+        }
+    }
+
+    /// The arbitration-phase bitrate, and the only one on a classical link.
     public var bitrate: UInt32
     public var busAccess: BusAccess
+    /// Classical CAN by default. Requesting CAN FD from an adapter that does
+    /// not report `GS_CAN_FEATURE_FD` is refused at connect rather than
+    /// quietly downgraded — see `GsUsbDeviceError.canFDNotSupported`.
+    public var frameFormat: FrameFormat
     /// `GS_CAN_FEATURE_ONE_SHOT`, requested when the device offers it. Silent
     /// in listen-only — there is nothing to retransmit — but requested anyway
     /// so the flag word does not change meaning when phase 7 adds transmit.
@@ -41,18 +71,21 @@ public struct GsUsbOptions: Sendable, Equatable {
     public init(
         bitrate: UInt32 = 500_000,
         busAccess: BusAccess = .listenOnly,
+        frameFormat: FrameFormat = .classical,
         oneShot: Bool = true,
         hardwareTimestamps: Bool = true,
         serialNumber: String? = nil
     ) {
         self.bitrate = bitrate
         self.busAccess = busAccess
+        self.frameFormat = frameFormat
         self.oneShot = oneShot
         self.hardwareTimestamps = hardwareTimestamps
         self.serialNumber = serialNumber
     }
 
     public var listenOnly: Bool { busAccess == .listenOnly }
+    public var canFD: Bool { frameFormat.isCanFD }
 }
 
 // MARK: - Timestamp mode
@@ -91,9 +124,22 @@ public enum GsUsbTimestampMode: String, Sendable, Equatable, CaseIterable {
 public enum GsUsbDeviceError: Error, Equatable, Sendable, CustomStringConvertible {
     /// No attached adapter matched. Ordinary before the cable is plugged in.
     case noDeviceFound(serialNumber: String?)
-    /// The device reports `GS_CAN_FEATURE_FD`. Out of scope (§11), and
-    /// refused rather than configured as classical and hoped for.
-    case canFDNotSupported
+    /// CAN FD was requested and the device does not report
+    /// `GS_CAN_FEATURE_FD`.
+    ///
+    /// Refused rather than brought up classical, for the same reason
+    /// `listenOnlyNotSupported` is: the caller asked for a link that carries
+    /// 64-byte frames, and a classical link silently substituted would drop
+    /// every FD frame on the bus while reporting a healthy connection.
+    case canFDNotSupported(reportedFeatures: UInt32)
+    /// CAN FD was requested and the device reports `GS_CAN_FEATURE_FD` but not
+    /// `GS_CAN_FEATURE_BT_CONST_EXT`, so its data-phase segment and prescaler
+    /// limits cannot be read and the data bitrate cannot be solved.
+    ///
+    /// The arbitration limits are not a substitute: an FDCAN peripheral's data
+    /// phase has its own, differently shaped ranges, and solving against the
+    /// wrong ones would configure a data bitrate that is not the one reported.
+    case dataBitTimingConstantsUnavailable(reportedFeatures: UInt32)
     /// Listen-only was asked for and the device cannot do it. The one case
     /// where failing to connect is the correct outcome: a device that cannot
     /// be silent must not be opened when silence was the requirement.
@@ -107,7 +153,8 @@ public enum GsUsbDeviceError: Error, Equatable, Sendable, CustomStringConvertibl
         switch self {
         case .noDeviceFound:
             return false
-        case .canFDNotSupported, .listenOnlyNotSupported, .multiChannelDevice:
+        case .canFDNotSupported, .dataBitTimingConstantsUnavailable,
+             .listenOnlyNotSupported, .multiChannelDevice:
             return true
         }
     }
@@ -119,8 +166,19 @@ public enum GsUsbDeviceError: Error, Equatable, Sendable, CustomStringConvertibl
                 return "no gs_usb adapter with serial \(serial) is attached"
             }
             return "no gs_usb adapter is attached"
-        case .canFDNotSupported:
-            return "this adapter reports CAN FD, which this tool does not support"
+        case .canFDNotSupported(let features):
+            return String(
+                format: "CAN FD was requested and this adapter does not support "
+                    + "it (features 0x%08x); refusing to open it as classical CAN",
+                features
+            )
+        case .dataBitTimingConstantsUnavailable(let features):
+            return String(
+                format: "CAN FD was requested and this adapter does not report "
+                    + "its data-phase bit-timing limits (features 0x%08x), so the "
+                    + "data bitrate cannot be solved",
+                features
+            )
         case .listenOnlyNotSupported(let features):
             return String(
                 format: "listen-only was requested and this adapter does not "
@@ -151,6 +209,13 @@ public enum GsUsbTransmitError: Error, Equatable, Sendable, CustomStringConverti
     /// frame on a vehicle bus the operator never armed for — so this is a
     /// refusal, permanently, and not a condition `send` tries to fix.
     case listenOnly
+    /// A CAN FD frame was handed to a connection brought up as classical CAN.
+    ///
+    /// Same shape of refusal as `listenOnly`, and for the same reason: the
+    /// controller's frame format was fixed at `MODE`, so the only way to
+    /// honour this would be to send the payload as a classical frame — a
+    /// different frame, truncated to 8 bytes, that the caller did not ask for.
+    case canFDNotEnabled
     /// No connection is up, so there is no endpoint to write to.
     case notConnected
     /// The echo never came back inside the timeout. Design §6.2: with
@@ -168,6 +233,10 @@ public enum GsUsbTransmitError: Error, Equatable, Sendable, CustomStringConverti
         case .listenOnly:
             return "this connection is listen-only, so it cannot transmit; "
                 + "reconnect with bus access enabled to send frames"
+        case .canFDNotEnabled:
+            return "this connection is classical CAN, so it cannot transmit a "
+                + "CAN FD frame; reconnect with frameFormat: "
+                + ".canFD(dataBitrate:) to send one"
         case .notConnected:
             return "no adapter is connected"
         case .notAcknowledged:
@@ -271,7 +340,11 @@ public actor GsUsbDevice {
     /// which is the only scope in which frames are compared or diffed.
     private var nextSeq: UInt64 = 0
     private var mapper: TimestampMapper?
-    private var frameLayout = GsHostFrame.Layout.classical
+    /// Whether this connection's frames carry the trailing `timestamp_us`
+    /// word, in both directions. Half of what sizes a frame; the other half is
+    /// the frame's own `GS_CAN_FLAG_FD`, which is why there is no single
+    /// stored layout any more.
+    private var framesAreTimestamped = false
     private var lastBusState = GsCanState.errorActive
     /// Set by the state poller when it decides the connection is over, so the
     /// reason the read loop reports (an aborted transfer) does not mask the
@@ -419,12 +492,21 @@ public actor GsUsbDevice {
     /// the wire" rather than "this frame was handed to USB". Returning early
     /// would make the recording's `tx` frames and the UI's send confirmations
     /// both claims nobody checked.
+    ///
+    /// Three refusals, and none of them is a condition `send` tries to fix: a
+    /// listen-only connection, a `fd` frame on a connection brought up as
+    /// classical CAN, and a payload the frame's own format cannot express —
+    /// above 8 bytes classical, or a CAN FD length no DLC stands for.
     public func send(_ frame: GsUsbOutboundFrame) async throws {
         // First, before any state is touched and any byte is written. A
         // listen-only controller holds its TX pin recessive, so this is a
         // statement about the hardware, not a policy that could be relaxed.
         guard !options.listenOnly else { throw GsUsbTransmitError.listenOnly }
-        guard frame.data.count <= 8 else {
+        // Before the payload is looked at: which format the controller is in
+        // decides what "too long" even means.
+        if frame.fd {
+            guard options.canFD else { throw GsUsbTransmitError.canFDNotEnabled }
+        } else if frame.data.count > 8 {
             throw GsUsbTransmitError.invalidFrame(
                 "a classical CAN frame carries at most 8 bytes; this one has "
                     + "\(frame.data.count)"
@@ -441,8 +523,16 @@ public actor GsUsbDevice {
                 canID: frame.canID,
                 extended: frame.extended,
                 remoteRequest: frame.rtr,
+                canFD: frame.fd,
+                bitRateSwitch: frame.bitRateSwitch,
                 data: frame.data
-            ).encoded(as: frameLayout)
+            ).encoded(as: GsHostFrame.Layout(
+                // The frame's own format, not the connection's: the device
+                // sizes the transfer it is being handed from the FD flag in
+                // these very bytes, so a classical frame on a CAN FD link goes
+                // out as the 24-byte struct and is echoed back as one.
+                canFD: frame.fd, timestamped: framesAreTimestamped
+            ))
         } catch {
             releaseSlot(slot)
             throw GsUsbTransmitError.invalidFrame(Self.describe(error))
@@ -644,13 +734,18 @@ public actor GsUsbDevice {
         let features: GsCanFeature
         let modeFlags: GsCanFeature
         let timestampMode: GsUsbTimestampMode
-        let layout: GsHostFrame.Layout
+        /// Whether `gs_host_frame` carries its trailing timestamp word on this
+        /// connection. Not a full layout, because CAN FD makes the data field
+        /// a property of each frame rather than of the connection.
+        let timestamped: Bool
     }
 
     // MARK: - Handshake
 
-    /// Enumerate, open, and run design §9's four configuring transfers:
-    /// `HOST_FORMAT` → `BT_CONST` → `BITTIMING` → `MODE(START, flags)`.
+    /// Enumerate, open, and run design §9's configuring transfers:
+    /// `HOST_FORMAT` → `BT_CONST` → (`BT_CONST_EXT`) → `BITTIMING` →
+    /// (`DATA_BITTIMING`) → `MODE(START, flags)`, the bracketed two only on a
+    /// CAN FD connection.
     ///
     /// The order is not cosmetic. `HOST_FORMAT` declares the host's byte order
     /// and so must precede the first multi-byte struct read back. `BT_CONST`
@@ -660,6 +755,12 @@ public actor GsUsbDevice {
     /// happens in the window between `BT_CONST` and `BITTIMING` — after the
     /// device has told us what it is, and before a single transfer that would
     /// change how it behaves on the bus.
+    ///
+    /// `BT_CONST_EXT` is an IN transfer and both bit-timing solutions are
+    /// computed before either is sent, which keeps that window intact for CAN
+    /// FD too: an unreachable data bitrate is refused with the arbitration
+    /// phase still unconfigured, rather than leaving the controller half set
+    /// up at a rate nobody asked to run at.
     private func connectAndConfigure() async throws -> Configuration {
         let devices = try await transport.enumerate()
         let device: UsbDeviceRef
@@ -702,16 +803,48 @@ public actor GsUsbDevice {
         let constants = try GsDeviceBtConst(decoding: constantBytes)
         let features = constants.feature
 
-        // 3. The refusals, before anything is configured.
-        if features.contains(.canFD) {
-            throw GsUsbDeviceError.canFDNotSupported
+        // 3. The refusals, before anything is configured. An FD-capable
+        // adapter is *not* refused for being FD-capable: it runs classical
+        // unless CAN FD was asked for, which is what the device does too when
+        // `GS_CAN_MODE_FD` is absent from the flag word.
+        if options.canFD {
+            if !features.contains(.canFD) {
+                throw GsUsbDeviceError.canFDNotSupported(reportedFeatures: features.rawValue)
+            }
+            if !features.contains(.btConstExt) {
+                throw GsUsbDeviceError.dataBitTimingConstantsUnavailable(
+                    reportedFeatures: features.rawValue
+                )
+            }
         }
         if options.listenOnly, !features.contains(.listenOnly) {
             throw GsUsbDeviceError.listenOnlyNotSupported(reportedFeatures: features.rawValue)
         }
 
-        // 4. BITTIMING.
+        // 4. BT_CONST_EXT, for the data phase's own limits. An IN, so the
+        // refusal window above is still open behind it.
+        var dataConstants: GsDeviceBtConst?
+        if options.canFD {
+            let extendedBytes = try await transport.controlTransfer(
+                .vendorInterfaceIn(
+                    request: GsUsbBreq.btConstExt.rawValue,
+                    value: 0,
+                    interface: interface.interfaceNumber,
+                    length: GsDeviceBtConstExtended.byteCount
+                ),
+                payload: []
+            )
+            dataConstants = try GsDeviceBtConstExtended(decoding: extendedBytes).dataPhase
+        }
+
+        // 5. Both phases solved before either is sent.
         let timing = try BitTiming.solve(bitrate: options.bitrate, constants: constants)
+        var dataTiming: BitTiming?
+        if let dataConstants, let dataBitrate = options.frameFormat.dataBitrate {
+            dataTiming = try BitTiming.solve(bitrate: dataBitrate, constants: dataConstants)
+        }
+
+        // 6. BITTIMING.
         _ = try await transport.controlTransfer(
             .vendorInterfaceOut(
                 request: GsUsbBreq.bittiming.rawValue,
@@ -722,7 +855,22 @@ public actor GsUsbDevice {
             payload: timing.bittiming.encoded()
         )
 
-        // 5. MODE(START, flags). The flag word is the read-only guarantee: it
+        // 7. DATA_BITTIMING. Same 20-byte `gs_device_bittiming` struct as the
+        // arbitration phase; only the request code and the limits it was
+        // solved against differ.
+        if let dataTiming {
+            _ = try await transport.controlTransfer(
+                .vendorInterfaceOut(
+                    request: GsUsbBreq.dataBittiming.rawValue,
+                    value: 0,
+                    interface: interface.interfaceNumber,
+                    length: GsDeviceBittiming.byteCount
+                ),
+                payload: dataTiming.bittiming.encoded()
+            )
+        }
+
+        // 8. MODE(START, flags). The flag word is the read-only guarantee: it
         // is what makes the controller silent, and it is re-derived here on
         // every attempt so a reconnect cannot come back bus-active.
         let flags = Self.modeFlags(options: options, features: features)
@@ -754,9 +902,9 @@ public actor GsUsbDevice {
             modeFlags: flags,
             timestampMode: mode,
             // The device appends the timestamp word only when the feature was
-            // negotiated, so what we asked for is what decides the layout —
-            // and therefore how a multi-frame bulk buffer is cut up.
-            layout: mode == .hardware ? .classicalWithTimestamp : .classical
+            // negotiated, so what we asked for is what decides this half of
+            // the layout.
+            timestamped: mode == .hardware
         )
     }
 
@@ -779,6 +927,14 @@ public actor GsUsbDevice {
         }
         if options.hardwareTimestamps, features.contains(.hardwareTimestamp) {
             flags.insert(.hardwareTimestamp)
+        }
+        // `GS_CAN_MODE_FD` shares bit 8 with `GS_CAN_FEATURE_FD`. Taken from
+        // the options and not conditioned on the feature word, exactly like
+        // `listenOnly`: a device that cannot do it has already been refused,
+        // so there is no path here that drops the bit and brings the link up
+        // as classical CAN instead.
+        if options.canFD {
+            flags.insert(.canFD)
         }
         // Requested whenever offered (§7.2): BERR reporting is half of what
         // replaced gap detection, and it costs nothing on a silent controller.
@@ -803,7 +959,7 @@ public actor GsUsbDevice {
         refusal = nil
         pendingDisconnectReason = nil
         lastBusState = .errorActive
-        frameLayout = configuration.layout
+        framesAreTimestamped = configuration.timestamped
         timestampMode = configuration.timestampMode
         resetTransmitSlots()
         isConnected = true
@@ -881,20 +1037,28 @@ public actor GsUsbDevice {
             // A zero-length bulk transfer is USB framing, not data.
             if buffer.isEmpty { continue }
 
-            let stride = frameLayout.byteCount
-            guard buffer.count % stride == 0 else {
-                // A buffer that is not a whole number of frames means the
-                // negotiated layout and the firmware's disagree. Counting it is
-                // the only honest option: there is no offset at which the next
-                // frame is known to start.
-                statistics.decodeFailures += 1
-                continue
-            }
-
+            // Frames are self-describing rather than a fixed stride, because
+            // on a CAN FD connection they are not all the same size: the
+            // firmware sizes each one from its own `GS_CAN_FLAG_FD`, so a
+            // 24-byte classical frame and an 80-byte CAN FD frame can sit back
+            // to back in one transfer and the only way to find the second is
+            // to read the first one's flags.
             var offset = 0
-            while offset + stride <= buffer.count {
-                let slice = Array(buffer[offset..<(offset + stride)])
-                offset += stride
+            while offset + GsHostFrame.headerByteCount <= buffer.count {
+                let flags = GsHostFrameFlags(
+                    rawValue: buffer[offset + GsHostFrame.flagsByteOffset]
+                )
+                let layout = GsHostFrame.Layout(
+                    canFD: flags.contains(.canFD), timestamped: framesAreTimestamped
+                )
+                // Short of what its own header says it is. Stopping here rather
+                // than hunting for the next plausible header: there is no
+                // offset at which a following frame is *known* to start, and
+                // the trailing-bytes count below records it.
+                guard offset + layout.byteCount <= buffer.count else { break }
+
+                let slice = Array(buffer[offset..<(offset + layout.byteCount)])
+                offset += layout.byteCount
 
                 guard let hostFrame = try? GsHostFrame(decoding: slice) else {
                     statistics.decodeFailures += 1
@@ -915,6 +1079,14 @@ public actor GsUsbDevice {
                 }
 
                 await publish(hostFrame, tx: false)
+            }
+
+            // Bytes left over that are not a whole frame mean the negotiated
+            // layout and the firmware's disagree. Counting it is the only
+            // honest option; the frames already cut out of this buffer were
+            // each described by their own header and stand.
+            if offset != buffer.count {
+                statistics.decodeFailures += 1
             }
         }
         return "stopped"
@@ -987,6 +1159,9 @@ public actor GsUsbDevice {
             // gs_usb delivers CAN error frames as host frames with the error
             // flag set, which lands on the existing field with no model change.
             err: hostFrame.isError,
+            fd: hostFrame.isCanFD,
+            bitRateSwitch: hostFrame.isBitRateSwitch,
+            errorStateIndicator: hostFrame.isErrorStateIndicator,
             data: hostFrame.data,
             tx: tx,
             sourceDescription: sourceDescription
@@ -1138,6 +1313,11 @@ public actor GsUsbDevice {
     /// §8.4's free-text source description. `device` and `timestampMode` are
     /// `nil` before a connection has been configured, which is the form the
     /// status strip shows while connecting.
+    ///
+    /// A CAN FD connection shows both rates and the `fd` marker — `"gs_usb
+    /// CANable2 #0001 500k/2M fd bus-active hw-ts"`. The data rate is part of
+    /// the label rather than an aside because two captures taken at the same
+    /// arbitration rate and different data rates are not the same capture.
     static func describeSource(
         device: UsbDeviceRef?,
         options: GsUsbOptions,
@@ -1150,7 +1330,12 @@ public actor GsUsbDevice {
                 parts.append("#\(serial)")
             }
         }
-        parts.append(bitrateLabel(options.bitrate))
+        if let dataBitrate = options.frameFormat.dataBitrate {
+            parts.append("\(bitrateLabel(options.bitrate))/\(bitrateLabel(dataBitrate))")
+            parts.append("fd")
+        } else {
+            parts.append(bitrateLabel(options.bitrate))
+        }
         parts.append(options.listenOnly ? "listen-only" : "bus-active")
         if let timestampMode {
             parts.append(timestampMode.shortLabel)
@@ -1221,6 +1406,17 @@ public actor GsUsbDevice {
             return "the adapter delivered a \(count)-byte frame"
         case GsUsbProtocolError.invalidDataLength(let dlc):
             return "the adapter delivered a frame with DLC \(dlc)"
+        case GsUsbProtocolError.frameFormatDisagreesWithLength(let flags, let count):
+            return String(
+                format: "the adapter delivered a %d-byte frame whose flags "
+                    + "(0x%02x) describe a different size",
+                count, flags
+            )
+        case GsUsbProtocolError.unrepresentableDataLength(let count):
+            return "CAN FD carries 0–8, 12, 16, 20, 24, 32, 48 or 64 bytes; "
+                + "this frame has \(count)"
+        case GsUsbProtocolError.contradictoryFrameFlags(let message):
+            return message
         case is CancellationError:
             // `stop()` cancels the loop, which surfaces here from whatever was
             // being awaited. Not a fault — don't show it as one.

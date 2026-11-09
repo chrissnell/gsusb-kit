@@ -24,12 +24,29 @@ public enum GsUsbProtocolError: Error, Equatable, Sendable {
     case unknownMode(UInt32)
     /// `gs_device_state.state` carried a value outside `enum gs_can_state`.
     case unknownState(UInt32)
-    /// A bulk-IN buffer whose length matches neither the 20-byte classical
-    /// layout nor the 24-byte classical-with-timestamp layout.
+    /// A bulk-IN buffer whose length matches none of `GsHostFrame.Layout`'s
+    /// four sizes — 20 and 24 classical, 76 and 80 for CAN FD.
     case unsupportedFrameLength(Int)
-    /// `can_dlc` above 8. Classical CAN only, and `Frame.data` has no way to
-    /// represent more, so this is rejected rather than clamped silently.
+    /// `can_dlc` outside what the frame's own `GS_CAN_FLAG_FD` bit permits:
+    /// above 8 on a classical frame, above 15 on a CAN FD one. Rejected rather
+    /// than clamped silently, because a DLC that cannot be honoured means the
+    /// layout assumption is wrong and the payload would be invented.
     case invalidDataLength(UInt8)
+    /// `GS_CAN_FLAG_FD` and the buffer length disagree: the flag set on a
+    /// buffer only wide enough for the classical 8-byte data field, or clear on
+    /// one wide enough for CAN FD's 64.
+    ///
+    /// The two always agree on the wire — candleLight sizes each transfer from
+    /// that very flag — so a disagreement means the bytes are not the frame
+    /// they claim to be, and there is no payload that can be read out of them.
+    case frameFormatDisagreesWithLength(flags: UInt8, byteCount: Int)
+    /// A transmit payload whose length no CAN FD DLC can express. CAN FD's
+    /// lengths are 0–8, 12, 16, 20, 24, 32, 48 and 64; a 9-byte frame does not
+    /// exist on the wire, and the only way to send those nine bytes is as a
+    /// 12-byte frame whose last three the caller chose.
+    case unrepresentableDataLength(Int)
+    /// Transmit flags that contradict each other, with the rule they broke.
+    case contradictoryFrameFlags(String)
 }
 
 // MARK: - Little-endian cursor
@@ -392,6 +409,80 @@ public struct GsDeviceBtConst: Sendable, Equatable {
     }
 }
 
+// MARK: - gs_device_bt_const_extended
+
+/// `BREQ_BT_CONST_EXT` reply: `gs_device_bt_const` with a second
+/// `can_bittiming_const` appended for the CAN FD data phase.
+///
+/// Read only when the device reports both `GS_CAN_FEATURE_FD` and
+/// `GS_CAN_FEATURE_BT_CONST_EXT`, which is also what the Linux driver gates it
+/// on. A CAN FD device that does not offer it cannot have its data phase
+/// solved at all: the two phases run on the same `fclk_can` but have their own
+/// segment and prescaler limits, and the arbitration limits are not a usable
+/// substitute — an FDCAN peripheral's data-phase tseg1 range is a different
+/// shape from its nominal one.
+public struct GsDeviceBtConstExtended: Sendable, Equatable {
+    public static let byteCount = 72
+
+    /// The arbitration-phase constants, in the exact shape `BREQ_BT_CONST`
+    /// returns them. The first 40 bytes of this reply *are* a
+    /// `gs_device_bt_const`, so `BitTiming.solve` takes this unchanged.
+    public let arbitration: GsDeviceBtConst
+    /// The data-phase constants, carrying the same `feature` word and
+    /// `fclk_can` as `arbitration` so this too can be handed straight to
+    /// `BitTiming.solve`. Only the eight segment and prescaler limits differ.
+    public let dataPhase: GsDeviceBtConst
+
+    public var feature: GsCanFeature { arbitration.feature }
+    public var canClockHz: UInt32 { arbitration.canClockHz }
+
+    public init(arbitration: GsDeviceBtConst, dataPhase: GsDeviceBtConst) {
+        self.arbitration = arbitration
+        self.dataPhase = dataPhase
+    }
+
+    public init(decoding source: some Sequence<UInt8>) throws {
+        let bytes = Array(source)
+        guard bytes.count >= Self.byteCount else {
+            throw GsUsbProtocolError.truncated(expected: Self.byteCount, actual: bytes.count)
+        }
+        arbitration = try GsDeviceBtConst(decoding: bytes.prefix(GsDeviceBtConst.byteCount))
+
+        var cursor = try LittleEndianCursor(
+            bytes[GsDeviceBtConst.byteCount..<Self.byteCount], requiring: 32
+        )
+        dataPhase = GsDeviceBtConst(
+            feature: arbitration.feature,
+            canClockHz: arbitration.canClockHz,
+            tseg1Min: cursor.readUInt32(),
+            tseg1Max: cursor.readUInt32(),
+            tseg2Min: cursor.readUInt32(),
+            tseg2Max: cursor.readUInt32(),
+            sjwMax: cursor.readUInt32(),
+            brpMin: cursor.readUInt32(),
+            brpMax: cursor.readUInt32(),
+            brpInc: cursor.readUInt32()
+        )
+    }
+
+    /// The `feature` and `fclk_can` words come from `arbitration`; `dataPhase`'s
+    /// copies of them are not on the wire and are not written back.
+    public func encoded() -> [UInt8] {
+        var out = arbitration.encoded()
+        out.reserveCapacity(Self.byteCount)
+        let words = [
+            dataPhase.tseg1Min, dataPhase.tseg1Max,
+            dataPhase.tseg2Min, dataPhase.tseg2Max,
+            dataPhase.sjwMax,
+            dataPhase.brpMin, dataPhase.brpMax, dataPhase.brpInc,
+        ]
+        for word in words {
+            out.appendLittleEndian(word)
+        }
+        return out
+    }
+}
+
 // MARK: - gs_device_state
 
 /// `BREQ_GET_STATE` reply: the controller's error state and its two error
@@ -441,9 +532,13 @@ public struct GsDeviceState: Sendable, Equatable {
 
 // MARK: - gs_host_frame flags
 
-/// `GS_CAN_FLAG_*` from `gs_host_frame.flags`. Only `overflow` is meaningful
-/// on this adapter — the CAN FD bits are decoded so an unexpected value is
-/// visible rather than silently reinterpreted as payload.
+/// `GS_CAN_FLAG_*` from `gs_host_frame.flags`.
+///
+/// `canFD` is load-bearing in both directions and not merely descriptive: it
+/// is what sizes the transfer. candleLight picks each frame's length from this
+/// bit, so a bulk-IN buffer can hold a 24-byte classical frame and an 80-byte
+/// CAN FD one back to back, and the only way to find the second is to read the
+/// first one's flags.
 public struct GsHostFrameFlags: OptionSet, Sendable, Hashable {
     public let rawValue: UInt8
 
@@ -462,28 +557,81 @@ public struct GsHostFrameFlags: OptionSet, Sendable, Hashable {
 /// One `gs_host_frame` — the single structure carried on both bulk endpoints.
 ///
 /// ```
-/// [echo_id 4][can_id 4][can_dlc 1][channel 1][flags 1][reserved 1][data 8]
-///                                                              [timestamp_us 4]
+/// [echo_id 4][can_id 4][can_dlc 1][channel 1][flags 1][reserved 1]
+///                                     [data 8 | 64][timestamp_us 4]
 /// ```
 ///
-/// The trailing word is present only when `GS_CAN_FEATURE_HW_TIMESTAMP` was
-/// negotiated at `MODE`, which makes the buffer length the only thing that
-/// distinguishes the two layouts — hence `Layout`.
+/// Two things vary, and between them they give the four `Layout` cases. The
+/// data field is 8 bytes on a classical frame and 64 on a CAN FD one, chosen
+/// by that frame's own `GS_CAN_FLAG_FD`. The trailing timestamp word is
+/// present only when `GS_CAN_FEATURE_HW_TIMESTAMP` was negotiated at `MODE`,
+/// which is a property of the connection rather than of the frame.
 public struct GsHostFrame: Sendable, Equatable {
     /// `echo_id` for a frame the adapter observed on the bus. Any other value
     /// is the host's own transmit slot coming back as confirmation (§6.2).
     public static let receivedEchoID: UInt32 = 0xFFFF_FFFF
 
-    /// Which union member the firmware is using. Classical CAN only, because
-    /// the SH-C30A has no CAN FD (design §2).
+    /// Bytes before the data field: the two identifier words and the four
+    /// one-byte fields. Enough to read `flags`, which is what a reader needs
+    /// before it knows how long the rest of the frame is.
+    public static let headerByteCount = 12
+    /// Where `flags` sits, so a reader can size a frame without decoding it.
+    public static let flagsByteOffset = 10
+
+    /// `can_fd_dlc2len`: CAN FD's sixteen DLC codes and the payload length
+    /// each one means. Above 8 the steps are coarse, which is the whole reason
+    /// a CAN FD frame's length is not its DLC and this table has to exist.
+    public static let canFDDataLengths: [Int] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64,
+    ]
+
+    /// Payload length for a CAN FD `can_dlc`, or `nil` for a DLC above 15.
+    public static func dataLength(forCanFDDlc dlc: UInt8) -> Int? {
+        dlc < UInt8(canFDDataLengths.count) ? canFDDataLengths[Int(dlc)] : nil
+    }
+
+    /// The DLC that means exactly `length` bytes, or `nil` when no DLC does.
+    ///
+    /// Deliberately exact rather than rounding up to the next representable
+    /// length the way the Linux driver does. Rounding up transmits padding
+    /// bytes the caller never wrote, and on a bus being reverse-engineered a
+    /// frame whose tail nobody chose is a frame nobody can interpret. A caller
+    /// that wants a 12-byte frame says so by passing twelve bytes.
+    public static func canFDDlc(forDataLength length: Int) -> UInt8? {
+        canFDDataLengths.firstIndex(of: length).map(UInt8.init)
+    }
+
+    /// Which union member the firmware is using, and therefore how many bytes
+    /// one frame occupies.
     public enum Layout: Sendable, Equatable, CaseIterable {
         case classical
         case classicalWithTimestamp
+        case canFD
+        case canFDWithTimestamp
+
+        /// `struct classic_can` versus `struct canfd`. The wire field is this
+        /// wide whatever the DLC says.
+        public var dataFieldByteCount: Int { isCanFD ? 64 : 8 }
+
+        public var isCanFD: Bool {
+            self == .canFD || self == .canFDWithTimestamp
+        }
+
+        public var carriesTimestamp: Bool {
+            self == .classicalWithTimestamp || self == .canFDWithTimestamp
+        }
 
         public var byteCount: Int {
-            switch self {
-            case .classical: return 20
-            case .classicalWithTimestamp: return 24
+            GsHostFrame.headerByteCount + dataFieldByteCount + (carriesTimestamp ? 4 : 0)
+        }
+
+        /// The layout a frame occupies, from the two facts that decide it.
+        public init(canFD: Bool, timestamped: Bool) {
+            switch (canFD, timestamped) {
+            case (false, false): self = .classical
+            case (false, true): self = .classicalWithTimestamp
+            case (true, false): self = .canFD
+            case (true, true): self = .canFDWithTimestamp
             }
         }
 
@@ -491,6 +639,8 @@ public struct GsHostFrame: Sendable, Equatable {
             switch byteCount {
             case 20: self = .classical
             case 24: self = .classicalWithTimestamp
+            case 76: self = .canFD
+            case 80: self = .canFDWithTimestamp
             default: return nil
             }
         }
@@ -510,15 +660,17 @@ public struct GsHostFrame: Sendable, Equatable {
     public let channel: UInt8
     public let flags: GsHostFrameFlags
     public let reserved: UInt8
-    /// Payload truncated to `canDLC`. The wire field is always 8 bytes; the
-    /// bytes past the DLC are stale firmware buffer, not bus data.
+    /// Payload truncated to the length `canDLC` means — the DLC itself on a
+    /// classical frame, `canFDDataLengths[canDLC]` on a CAN FD one. The wire
+    /// field is the full 8 or 64 bytes either way; what lies past the declared
+    /// length is stale firmware buffer, not bus data.
     public let data: [UInt8]
-    /// Device microsecond counter, or `nil` on the classical layout.
+    /// Device microsecond counter, or `nil` on a layout that carries none.
     /// `TimestampMapper` is what turns this into a `Frame.timestampNs`.
     public let timestampMicroseconds: UInt32?
 
     public var layout: Layout {
-        timestampMicroseconds == nil ? .classical : .classicalWithTimestamp
+        Layout(canFD: isCanFD, timestamped: timestampMicroseconds != nil)
     }
 
     public var isReceived: Bool { echoID == Self.receivedEchoID }
@@ -536,6 +688,14 @@ public struct GsHostFrame: Sendable, Equatable {
     public var isRemoteRequest: Bool { rawCanID & Self.rtrFlag != 0 }
     public var isError: Bool { rawCanID & Self.errFlag != 0 }
     public var isOverflow: Bool { flags.contains(.overflow) }
+    public var isCanFD: Bool { flags.contains(.canFD) }
+    /// The data phase ran at the data bitrate. A CAN FD frame without this is
+    /// a 64-byte-capable frame sent entirely at the arbitration rate, which is
+    /// a different thing on the wire and worth keeping distinguishable.
+    public var isBitRateSwitch: Bool { flags.contains(.bitRateSwitch) }
+    /// The transmitting node was error-passive when it sent this frame. Set by
+    /// the sender's controller, not by anything the host can ask for.
+    public var isErrorStateIndicator: Bool { flags.contains(.errorStateIndicator) }
 
     // MARK: Decode
 
@@ -550,32 +710,85 @@ public struct GsHostFrame: Sendable, Equatable {
         rawCanID = cursor.readUInt32()
 
         let dlc = cursor.readUInt8()
-        guard dlc <= 8 else {
-            throw GsUsbProtocolError.invalidDataLength(dlc)
+        channel = cursor.readUInt8()
+        let frameFlags = GsHostFrameFlags(rawValue: cursor.readUInt8())
+        flags = frameFlags
+        reserved = cursor.readUInt8()
+
+        // The flag and the length are two statements about the same thing and
+        // the firmware derives one from the other, so a disagreement is not a
+        // frame with a confusing flag — it is bytes that are not this frame.
+        guard frameFlags.contains(.canFD) == layout.isCanFD else {
+            throw GsUsbProtocolError.frameFormatDisagreesWithLength(
+                flags: frameFlags.rawValue, byteCount: bytes.count
+            )
+        }
+
+        let length: Int
+        if layout.isCanFD {
+            guard let resolved = Self.dataLength(forCanFDDlc: dlc) else {
+                throw GsUsbProtocolError.invalidDataLength(dlc)
+            }
+            length = resolved
+        } else {
+            guard dlc <= 8 else {
+                throw GsUsbProtocolError.invalidDataLength(dlc)
+            }
+            length = Int(dlc)
         }
         canDLC = dlc
-
-        channel = cursor.readUInt8()
-        flags = GsHostFrameFlags(rawValue: cursor.readUInt8())
-        reserved = cursor.readUInt8()
-        data = Array(cursor.readBytes(8).prefix(Int(dlc)))
-        timestampMicroseconds = layout == .classicalWithTimestamp ? cursor.readUInt32() : nil
+        data = Array(cursor.readBytes(layout.dataFieldByteCount).prefix(length))
+        timestampMicroseconds = layout.carriesTimestamp ? cursor.readUInt32() : nil
     }
 
     // MARK: Encode
 
     /// Build a frame for transmit. `transmitSlot` is the host-chosen `echo_id`
     /// the device will hand back as confirmation.
+    ///
+    /// `canFD` is what selects the 64-byte data field and the DLC table that
+    /// goes with it, and it is also the bit the device reads to decide how long
+    /// the transfer it is being handed should be.
     public init(
         transmitSlot: UInt32,
         canID: UInt32,
         extended: Bool,
         remoteRequest: Bool = false,
+        canFD: Bool = false,
+        bitRateSwitch: Bool = false,
         channel: UInt8 = 0,
         data: [UInt8]
     ) throws {
-        guard data.count <= 8 else {
-            throw GsUsbProtocolError.invalidDataLength(UInt8(min(data.count, Int(UInt8.max))))
+        var frameFlags: GsHostFrameFlags = []
+        let dlc: UInt8
+
+        if canFD {
+            // CAN FD has no RTR bit: the position it occupied is the reserved
+            // RRS bit, which must be dominant. There is no remote-request CAN
+            // FD frame to encode, so this cannot be honoured by dropping a bit.
+            guard !remoteRequest else {
+                throw GsUsbProtocolError.contradictoryFrameFlags(
+                    "CAN FD has no remote-request frame; the RTR position is the "
+                        + "reserved RRS bit and must be dominant"
+                )
+            }
+            guard let resolved = Self.canFDDlc(forDataLength: data.count) else {
+                throw GsUsbProtocolError.unrepresentableDataLength(data.count)
+            }
+            dlc = resolved
+            frameFlags.insert(.canFD)
+            if bitRateSwitch { frameFlags.insert(.bitRateSwitch) }
+        } else {
+            guard !bitRateSwitch else {
+                throw GsUsbProtocolError.contradictoryFrameFlags(
+                    "a classical CAN frame has no data phase to switch the bit "
+                        + "rate for"
+                )
+            }
+            guard data.count <= 8 else {
+                throw GsUsbProtocolError.invalidDataLength(UInt8(min(data.count, Int(UInt8.max))))
+            }
+            dlc = UInt8(data.count)
         }
 
         var identifier = canID & (extended ? Self.effMask : Self.sffMask)
@@ -584,19 +797,23 @@ public struct GsHostFrame: Sendable, Equatable {
 
         echoID = transmitSlot
         rawCanID = identifier
-        canDLC = UInt8(data.count)
+        canDLC = dlc
         self.channel = channel
-        flags = []
+        flags = frameFlags
         reserved = 0
         self.data = data
         timestampMicroseconds = nil
     }
 
-    /// Serialise in the given layout. The layout is a parameter rather than a
-    /// property of the frame because it is a property of the *connection*: the
-    /// device expects the 24-byte struct in both directions once hardware
-    /// timestamping is negotiated, even though the host has no timestamp to
-    /// put there.
+    /// Serialise in the given layout.
+    ///
+    /// The layout is a parameter rather than being read off the frame because
+    /// the timestamp half of it belongs to the *connection*: the device expects
+    /// the larger struct in both directions once hardware timestamping is
+    /// negotiated, even though the host has no timestamp to put there. The
+    /// data-field half does come from the frame's own `canFD` flag, so passing
+    /// a layout that disagrees with it pads or truncates — which is why
+    /// `GsUsbDevice` derives the layout from the frame it is about to send.
     public func encoded(as layout: Layout) -> [UInt8] {
         var out = [UInt8]()
         out.reserveCapacity(layout.byteCount)
@@ -607,10 +824,11 @@ public struct GsHostFrame: Sendable, Equatable {
         out.append(flags.rawValue)
         out.append(reserved)
 
-        out.append(contentsOf: data.prefix(8))
-        out.append(contentsOf: [UInt8](repeating: 0, count: 8 - min(data.count, 8)))
+        let width = layout.dataFieldByteCount
+        out.append(contentsOf: data.prefix(width))
+        out.append(contentsOf: [UInt8](repeating: 0, count: width - min(data.count, width)))
 
-        if layout == .classicalWithTimestamp {
+        if layout.carriesTimestamp {
             out.appendLittleEndian(timestampMicroseconds ?? 0)
         }
         return out

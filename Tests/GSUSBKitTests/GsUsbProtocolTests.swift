@@ -256,6 +256,54 @@ private func le32(_ value: UInt32) -> [UInt8] {
     #expect(btConst.encoded() == bytes)
 }
 
+// MARK: - gs_device_bt_const_extended
+
+/// Values in the shape an FDCAN peripheral reports: one `fclk_can`, two sets
+/// of segment limits, and the data phase's are not the arbitration phase's.
+@Test func btConstExtendedDecodesBothPhasesOfTheEighteenWordLayout() throws {
+    let bytes = le32((1 << 0) | (1 << 8) | (1 << 10))
+        + le32(80_000_000)
+        + le32(1) + le32(256) + le32(1) + le32(128)
+        + le32(128) + le32(1) + le32(512) + le32(1)
+        + le32(1) + le32(32) + le32(1) + le32(16)
+        + le32(16) + le32(1) + le32(32) + le32(1)
+    #expect(bytes.count == GsDeviceBtConstExtended.byteCount)
+    #expect(GsDeviceBtConstExtended.byteCount == 72)
+
+    let extended = try GsDeviceBtConstExtended(decoding: bytes)
+    #expect(extended.feature == [.listenOnly, .canFD, .btConstExt])
+    #expect(extended.canClockHz == 80_000_000)
+
+    // The first 40 bytes are a `gs_device_bt_const` verbatim.
+    #expect(extended.arbitration.tseg1Max == 256)
+    #expect(extended.arbitration.tseg2Max == 128)
+    #expect(extended.arbitration.sjwMax == 128)
+    #expect(extended.arbitration.brpMax == 512)
+    let arbitrationAlone = try GsDeviceBtConst(decoding: bytes.prefix(40))
+    #expect(extended.arbitration == arbitrationAlone)
+
+    // The data phase's own limits, carrying the same feature word and clock so
+    // `BitTiming.solve` takes it with no adaptation.
+    #expect(extended.dataPhase.feature == extended.feature)
+    #expect(extended.dataPhase.canClockHz == 80_000_000)
+    #expect(extended.dataPhase.tseg1Min == 1)
+    #expect(extended.dataPhase.tseg1Max == 32)
+    #expect(extended.dataPhase.tseg2Min == 1)
+    #expect(extended.dataPhase.tseg2Max == 16)
+    #expect(extended.dataPhase.sjwMax == 16)
+    #expect(extended.dataPhase.brpMin == 1)
+    #expect(extended.dataPhase.brpMax == 32)
+    #expect(extended.dataPhase.brpInc == 1)
+
+    #expect(extended.encoded() == bytes)
+}
+
+@Test func btConstExtendedRejectsABufferShortOfItsSecondPhase() {
+    #expect(throws: GsUsbProtocolError.truncated(expected: 72, actual: 40)) {
+        _ = try GsDeviceBtConstExtended(decoding: [UInt8](repeating: 0, count: 40))
+    }
+}
+
 // MARK: - gs_host_frame fixtures
 
 /// A `gs_host_frame` built byte by byte:
@@ -271,8 +319,12 @@ private func hostFrameBytes(
     data: [UInt8],
     timestampMicroseconds: UInt32? = nil
 ) -> [UInt8] {
+    // The data field's width comes from the FD flag, exactly as it does in the
+    // firmware — a fixture that always padded to 8 could not express a CAN FD
+    // frame at all.
+    let width = flags & (1 << 1) != 0 ? 64 : 8
     var padded = data
-    padded.append(contentsOf: [UInt8](repeating: 0, count: max(0, 8 - padded.count)))
+    padded.append(contentsOf: [UInt8](repeating: 0, count: max(0, width - padded.count)))
     var out = le32(echoID) + le32(rawCanID) + [dlc, channel, flags, reserved] + padded
     if let timestampMicroseconds {
         out += le32(timestampMicroseconds)
@@ -280,11 +332,70 @@ private func hostFrameBytes(
     return out
 }
 
+private let fdFlag: UInt8 = 1 << 1
+private let brsFlag: UInt8 = 1 << 2
+private let esiFlag: UInt8 = 1 << 3
+
 // MARK: - gs_host_frame layout
 
 @Test func hostFrameLayoutByteCountsMatchTheUnionMembers() {
     #expect(GsHostFrame.Layout.classical.byteCount == 20)
     #expect(GsHostFrame.Layout.classicalWithTimestamp.byteCount == 24)
+    #expect(GsHostFrame.Layout.canFD.byteCount == 76)
+    #expect(GsHostFrame.Layout.canFDWithTimestamp.byteCount == 80)
+
+    // 12 header bytes plus the union member, which is what the firmware's
+    // `struct_size(frame, …)` computes.
+    for layout in GsHostFrame.Layout.allCases {
+        #expect(layout.byteCount
+            == GsHostFrame.headerByteCount
+                + layout.dataFieldByteCount
+                + (layout.carriesTimestamp ? 4 : 0))
+    }
+}
+
+/// The two facts that pick a layout are independent: the FD flag is the
+/// frame's, the timestamp word is the connection's.
+@Test func layoutIsTheProductOfTheFrameFormatAndTheTimestampFeature() {
+    #expect(GsHostFrame.Layout(canFD: false, timestamped: false) == .classical)
+    #expect(GsHostFrame.Layout(canFD: false, timestamped: true) == .classicalWithTimestamp)
+    #expect(GsHostFrame.Layout(canFD: true, timestamped: false) == .canFD)
+    #expect(GsHostFrame.Layout(canFD: true, timestamped: true) == .canFDWithTimestamp)
+}
+
+/// `flags` has to be readable before the frame's length is known, because that
+/// length is derived from it. The read loop indexes straight at this offset.
+@Test func theFlagsByteSitsWhereTheReadLoopLooksForIt() {
+    let bytes = hostFrameBytes(rawCanID: 0x100, dlc: 0, flags: fdFlag, data: [])
+    #expect(GsHostFrame.flagsByteOffset == 10)
+    #expect(GsHostFrame.headerByteCount == 12)
+    #expect(bytes[GsHostFrame.flagsByteOffset] == fdFlag)
+}
+
+// MARK: - CAN FD data lengths
+
+/// `can_fd_dlc2len`. Above 8 the steps are coarse, which is the whole reason a
+/// CAN FD frame's payload length is not its DLC.
+@Test func theCanFDDlcTableMatchesTheStandard() {
+    #expect(GsHostFrame.canFDDataLengths
+        == [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64])
+
+    for (dlc, length) in GsHostFrame.canFDDataLengths.enumerated() {
+        #expect(GsHostFrame.dataLength(forCanFDDlc: UInt8(dlc)) == length)
+        #expect(GsHostFrame.canFDDlc(forDataLength: length) == UInt8(dlc))
+    }
+
+    // A DLC is four bits; there is no 16th code.
+    #expect(GsHostFrame.dataLength(forCanFDDlc: 16) == nil)
+    #expect(GsHostFrame.dataLength(forCanFDDlc: 255) == nil)
+}
+
+/// Deliberately not the kernel's round-up-to-the-next-size behaviour: padding
+/// to a representable length transmits bytes the caller never wrote.
+@Test func anUnrepresentableCanFDLengthHasNoDlcRatherThanTheNextOneUp() {
+    for length in [9, 10, 11, 13, 17, 25, 33, 49, 63, 65] {
+        #expect(GsHostFrame.canFDDlc(forDataLength: length) == nil)
+    }
 }
 
 @Test func hostFrameDecodesTheTwentyByteClassicalLayout() throws {
@@ -320,6 +431,95 @@ private func hostFrameBytes(
     }
     #expect(throws: GsUsbProtocolError.unsupportedFrameLength(0)) {
         _ = try GsHostFrame(decoding: [])
+    }
+    // 12 header bytes plus the full classical data field *and* a timestamp is
+    // not a CAN FD frame; 76 and 80 are the only FD sizes.
+    #expect(throws: GsUsbProtocolError.unsupportedFrameLength(72)) {
+        _ = try GsHostFrame(decoding: [UInt8](repeating: 0, count: 72))
+    }
+}
+
+// MARK: - CAN FD frames
+
+@Test func hostFrameDecodesTheSeventySixByteCanFDLayout() throws {
+    let payload = (0..<64).map { UInt8($0) }
+    let bytes = hostFrameBytes(rawCanID: 0x321, dlc: 15, flags: fdFlag, data: payload)
+    #expect(bytes.count == 76)
+
+    let frame = try GsHostFrame(decoding: bytes)
+    #expect(frame.canID == 0x321)
+    #expect(frame.isCanFD)
+    #expect(frame.data == payload)
+    #expect(frame.layout == .canFD)
+    #expect(frame.timestampMicroseconds == nil)
+}
+
+@Test func hostFrameDecodesTheEightyByteCanFDTimestampLayout() throws {
+    let bytes = hostFrameBytes(
+        rawCanID: 0x1FFF_FFFF | 0x8000_0000, dlc: 9, flags: fdFlag | brsFlag,
+        data: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        timestampMicroseconds: 0x0BAD_F00D
+    )
+    #expect(bytes.count == 80)
+
+    let frame = try GsHostFrame(decoding: bytes)
+    #expect(frame.isExtended)
+    #expect(frame.canID == 0x1FFF_FFFF)
+    #expect(frame.isCanFD)
+    #expect(frame.isBitRateSwitch)
+    #expect(!frame.isErrorStateIndicator)
+    // DLC 9 means twelve bytes, which is the whole point of the table.
+    #expect(frame.data == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+    #expect(frame.timestampMicroseconds == 0x0BAD_F00D)
+    #expect(frame.layout == .canFDWithTimestamp)
+}
+
+/// The 64-byte wire field is as stale past the declared length as the 8-byte
+/// one is, and a DLC of 9 declares twelve bytes, not sixty-four.
+@Test func aCanFDPayloadIsTruncatedToTheLengthItsDlcMeans() throws {
+    let frame = try GsHostFrame(decoding: hostFrameBytes(
+        rawCanID: 0x100, dlc: 10, flags: fdFlag,
+        data: [UInt8](repeating: 0xEE, count: 64)
+    ))
+    #expect(frame.canDLC == 10)
+    #expect(frame.data == [UInt8](repeating: 0xEE, count: 16))
+}
+
+@Test func aCanFDFrameCarriesTheErrorStateIndicatorOfItsSender() throws {
+    let frame = try GsHostFrame(decoding: hostFrameBytes(
+        rawCanID: 0x100, dlc: 0, flags: fdFlag | esiFlag, data: []
+    ))
+    #expect(frame.isErrorStateIndicator)
+    #expect(frame.data.isEmpty)
+}
+
+/// The firmware sizes each transfer from this very flag, so a disagreement is
+/// not a frame with an odd flag — it is bytes that are not the frame they say.
+@Test func theFdFlagAndTheBufferLengthMustAgree() {
+    var classicalLength = hostFrameBytes(rawCanID: 0x100, dlc: 0, data: [])
+    classicalLength[GsHostFrame.flagsByteOffset] = fdFlag
+    #expect(throws: GsUsbProtocolError.frameFormatDisagreesWithLength(
+        flags: fdFlag, byteCount: 20
+    )) {
+        _ = try GsHostFrame(decoding: classicalLength)
+    }
+
+    var fdLength = hostFrameBytes(rawCanID: 0x100, dlc: 0, flags: fdFlag, data: [])
+    fdLength[GsHostFrame.flagsByteOffset] = 0
+    #expect(throws: GsUsbProtocolError.frameFormatDisagreesWithLength(
+        flags: 0, byteCount: 76
+    )) {
+        _ = try GsHostFrame(decoding: fdLength)
+    }
+}
+
+/// A four-bit field cannot hold 16, so this is the decoder refusing a byte the
+/// firmware could not have written — not a reachable bus condition.
+@Test func aCanFDFrameRejectsADlcAboveFifteen() {
+    var bytes = hostFrameBytes(rawCanID: 0x100, dlc: 0, flags: fdFlag, data: [])
+    bytes[8] = 16
+    #expect(throws: GsUsbProtocolError.invalidDataLength(16)) {
+        _ = try GsHostFrame(decoding: bytes)
     }
 }
 
@@ -499,6 +699,85 @@ private func hostFrameBytes(
     }
 }
 
+// MARK: - encode for transmit: CAN FD
+
+@Test func aCanFDTransmitFrameEncodesTheFlagTheDlcAndTheSixtyFourByteField() throws {
+    let payload = [UInt8](repeating: 0x5A, count: 24)
+    let frame = try GsHostFrame(
+        transmitSlot: 2, canID: 0x1A0, extended: false,
+        canFD: true, bitRateSwitch: true, data: payload
+    )
+    // 24 bytes is DLC 12, not 11: the table is not contiguous past 8.
+    #expect(frame.canDLC == 12)
+    #expect(frame.isCanFD)
+    #expect(frame.isBitRateSwitch)
+
+    let encoded = frame.encoded(as: .canFD)
+    #expect(encoded.count == 76)
+    #expect(encoded == hostFrameBytes(
+        echoID: 2, rawCanID: 0x1A0, dlc: 12, flags: fdFlag | brsFlag, data: payload
+    ))
+    // Only the declared 24 bytes are payload; the rest of the field is zeroed
+    // rather than left as whatever was in the buffer.
+    #expect(Array(encoded[(12 + 24)..<76]) == [UInt8](repeating: 0, count: 40))
+}
+
+@Test func aCanFDTransmitFramePadsToEightyBytesWhenTimestampingIsNegotiated() throws {
+    let frame = try GsHostFrame(
+        transmitSlot: 0, canID: 0x1A0, extended: false, canFD: true, data: [0x01]
+    )
+    let encoded = frame.encoded(as: .canFDWithTimestamp)
+    #expect(encoded.count == 80)
+    #expect(Array(encoded.suffix(4)) == [0, 0, 0, 0])
+}
+
+/// The length has to be one CAN FD can express. Rounding 9 up to 12 would put
+/// three bytes on the bus that the caller never chose.
+@Test func aCanFDTransmitFrameRejectsALengthNoDlcCanExpress() {
+    #expect(throws: GsUsbProtocolError.unrepresentableDataLength(9)) {
+        _ = try GsHostFrame(
+            transmitSlot: 0, canID: 0x100, extended: false, canFD: true,
+            data: [UInt8](repeating: 0, count: 9)
+        )
+    }
+    #expect(throws: GsUsbProtocolError.unrepresentableDataLength(65)) {
+        _ = try GsHostFrame(
+            transmitSlot: 0, canID: 0x100, extended: false, canFD: true,
+            data: [UInt8](repeating: 0, count: 65)
+        )
+    }
+}
+
+/// CAN FD has no remote-request frame: the RTR position is the reserved RRS
+/// bit and must be dominant. There is nothing to encode here.
+@Test func aCanFDTransmitFrameCannotBeARemoteRequest() throws {
+    let error = #expect(throws: GsUsbProtocolError.self) {
+        _ = try GsHostFrame(
+            transmitSlot: 0, canID: 0x100, extended: false,
+            remoteRequest: true, canFD: true, data: []
+        )
+    }
+    guard case .contradictoryFrameFlags(let message) = error else {
+        Issue.record("expected contradictoryFrameFlags, got \(String(describing: error))")
+        return
+    }
+    #expect(message.contains("remote-request"))
+}
+
+@Test func aClassicalTransmitFrameCannotSwitchTheBitRate() throws {
+    let error = #expect(throws: GsUsbProtocolError.self) {
+        _ = try GsHostFrame(
+            transmitSlot: 0, canID: 0x100, extended: false,
+            bitRateSwitch: true, data: []
+        )
+    }
+    guard case .contradictoryFrameFlags(let message) = error else {
+        Issue.record("expected contradictoryFrameFlags, got \(String(describing: error))")
+        return
+    }
+    #expect(message.contains("data phase"))
+}
+
 /// A decoded frame must survive re-encoding byte for byte, including the
 /// timestamp word. Anything less means the decoder is discarding wire state.
 @Test func decodedFrameRoundTripsBackToTheSameBytes() throws {
@@ -514,4 +793,11 @@ private func hostFrameBytes(
     )
     let frame = try GsHostFrame(decoding: timestamped)
     #expect(frame.encoded(as: .classicalWithTimestamp) == timestamped)
+
+    let fd = hostFrameBytes(
+        echoID: 7, rawCanID: 0x4FF, dlc: 13, flags: fdFlag | brsFlag | esiFlag,
+        data: [UInt8](repeating: 0xC3, count: 32),
+        timestampMicroseconds: 0x0001_0203
+    )
+    #expect(try GsHostFrame(decoding: fd).encoded(as: .canFDWithTimestamp) == fd)
 }

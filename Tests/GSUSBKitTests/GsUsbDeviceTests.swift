@@ -22,6 +22,14 @@ import Testing
 /// treated as a protocol error.
 private let shC30xFeatures = GsCanFeature(rawValue: 0x0005_30BB)
 
+/// What a CAN FD adapter reports: the SH-C30x's feature set plus `FD` and the
+/// `BT_CONST_EXT` that has to come with it, minus the two bits upstream gs_usb
+/// does not define so the FD assertions read against a known word.
+private let fdFeatures: GsCanFeature = [
+    .listenOnly, .oneShot, .hardwareTimestamp, .canFD, .btConstExt,
+    .berrReporting, .getState,
+]
+
 private let anchorRealtimeNs: Int64 = 1_700_000_000_000_000_000
 
 private func constants(features: GsCanFeature) -> GsDeviceBtConst {
@@ -45,6 +53,28 @@ private func littleEndian(_ value: UInt32) -> [UInt8] {
     ]
 }
 
+/// An FDCAN peripheral's two sets of limits: 80 MHz, wide arbitration ranges
+/// and the narrower data-phase ones. 2 Mbit/s solves exactly here, which is
+/// what keeps the FD handshake tests about the handshake.
+private func extendedConstants(features: GsCanFeature) -> GsDeviceBtConstExtended {
+    GsDeviceBtConstExtended(
+        arbitration: GsDeviceBtConst(
+            feature: features,
+            canClockHz: 80_000_000,
+            tseg1Min: 1, tseg1Max: 256,
+            tseg2Min: 1, tseg2Max: 128,
+            sjwMax: 128, brpMin: 1, brpMax: 512, brpInc: 1
+        ),
+        dataPhase: GsDeviceBtConst(
+            feature: features,
+            canClockHz: 80_000_000,
+            tseg1Min: 1, tseg1Max: 32,
+            tseg2Min: 1, tseg2Max: 16,
+            sjwMax: 16, brpMin: 1, brpMax: 32, brpInc: 1
+        )
+    )
+}
+
 private func session(
     features: GsCanFeature,
     bulkReads: [ScriptedUsbTransport.BulkStep] = [],
@@ -52,19 +82,35 @@ private func session(
     busState: GsDeviceState = GsDeviceState(
         state: .errorActive, receiveErrorCount: 0, transmitErrorCount: 0
     ),
-    deviceMicroseconds: UInt32 = 0
+    deviceMicroseconds: UInt32 = 0,
+    /// When non-nil, the session also answers `BT_CONST_EXT` and accepts
+    /// `DATA_BITTIMING`. Left off by default so a classical connection that
+    /// sent either would fail rather than be quietly serviced — an unscripted
+    /// request throws.
+    extended: GsDeviceBtConstExtended? = nil,
+    echoesWrites: Bool = false
 ) -> ScriptedUsbTransport.Session {
-    ScriptedUsbTransport.Session(
-        control: [
-            GsUsbBreq.hostFormat.rawValue: .acknowledged,
-            GsUsbBreq.btConst.rawValue: .bytes(constants(features: features).encoded()),
-            GsUsbBreq.bittiming.rawValue: .acknowledged,
-            GsUsbBreq.mode.rawValue: .acknowledged,
-            GsUsbBreq.getState.rawValue: .bytes(busState.encoded()),
-            GsUsbBreq.timestamp.rawValue: .bytes(littleEndian(deviceMicroseconds)),
-        ],
+    var control: [UInt8: ScriptedUsbTransport.ControlResponse] = [
+        GsUsbBreq.hostFormat.rawValue: .acknowledged,
+        GsUsbBreq.btConst.rawValue: .bytes(constants(features: features).encoded()),
+        GsUsbBreq.bittiming.rawValue: .acknowledged,
+        GsUsbBreq.mode.rawValue: .acknowledged,
+        GsUsbBreq.getState.rawValue: .bytes(busState.encoded()),
+        GsUsbBreq.timestamp.rawValue: .bytes(littleEndian(deviceMicroseconds)),
+    ]
+    if let extended {
+        // `BT_CONST_EXT` is a superset of `BT_CONST` and the device answers
+        // both, so the arbitration limits come from the same place either way.
+        control[GsUsbBreq.btConst.rawValue] = .bytes(extended.arbitration.encoded())
+        control[GsUsbBreq.btConstExt.rawValue] = .bytes(extended.encoded())
+        control[GsUsbBreq.dataBittiming.rawValue] = .acknowledged
+    }
+
+    return ScriptedUsbTransport.Session(
+        control: control,
         bulkReads: bulkReads,
         bulkEnd: bulkEnd,
+        echoesWrites: echoesWrites,
         interfaceInfo: UsbInterfaceInfo(
             interfaceNumber: 0,
             // Measured on the real device: both bulk endpoints are 32 bytes,
@@ -72,6 +118,23 @@ private func session(
             bulkInMaxPacketSize: 32,
             bulkOutMaxPacketSize: 32
         )
+    )
+}
+
+/// A ready-made CAN FD session: FD plus `BT_CONST_EXT` in the feature word,
+/// the FDCAN limits, and both FD control requests scripted.
+private func fdSession(
+    features: GsCanFeature = fdFeatures,
+    bulkReads: [ScriptedUsbTransport.BulkStep] = [],
+    bulkEnd: ScriptedUsbTransport.BulkStep = .hang,
+    echoesWrites: Bool = false
+) -> ScriptedUsbTransport.Session {
+    session(
+        features: features,
+        bulkReads: bulkReads,
+        bulkEnd: bulkEnd,
+        extended: extendedConstants(features: features),
+        echoesWrites: echoesWrites
     )
 }
 
@@ -87,13 +150,19 @@ private func hostFrameBytes(
     flags: GsHostFrameFlags = [],
     timestampMicroseconds: UInt32? = nil
 ) -> [UInt8] {
+    // `canFD` decides both the DLC encoding and the data field's width, which
+    // is how the firmware sizes the transfer it sends.
+    let isCanFD = flags.contains(.canFD)
+    let width = isCanFD ? 64 : 8
     var out = littleEndian(echoID) + littleEndian(rawCanID)
-    out.append(UInt8(data.count))
+    out.append(isCanFD
+        ? (GsHostFrame.canFDDlc(forDataLength: data.count) ?? 0xFF)
+        : UInt8(data.count))
     out.append(channel)
     out.append(flags.rawValue)
     out.append(0)
     out += data
-    out += [UInt8](repeating: 0, count: 8 - data.count)
+    out += [UInt8](repeating: 0, count: width - data.count)
     if let timestampMicroseconds {
         out += littleEndian(timestampMicroseconds)
     }
@@ -308,15 +377,15 @@ private func modePayloads(_ exchanges: [ScriptedUsbTransport.ControlExchange]) -
 
 // MARK: - Refusals
 
-@Test func aDeviceReportingCanFDIsRefusedBeforeItIsConfigured() async throws {
-    let transport = ScriptedUsbTransport(sessions: [
-        session(features: [.listenOnly, .canFD]),
-    ])
+@Test func canFDIsRefusedRatherThanDowngradedWhenUnsupported() async throws {
+    // Everything the SH-C30x offers, which is everything except CAN FD.
+    let transport = ScriptedUsbTransport(sessions: [session(features: shC30xFeatures)])
     let clock = GsUsbVirtualClock()
     let collector = CollectingFrameConsumer()
     let device = makeDevice(
         transport,
         consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000)),
         backoff: GsUsbBackoffPolicy(delays: [.seconds(1)]),
         clock: clock
     )
@@ -327,10 +396,71 @@ private func modePayloads(_ exchanges: [ScriptedUsbTransport.ControlExchange]) -
     await device.stop()
 
     #expect(reason.contains("CAN FD"))
+    #expect(reason.contains("refusing to open it as classical CAN"))
+    // Nothing that changes how the controller behaves on the bus went out.
+    let requests = await transport.controlExchanges.map(\.request.request)
+    #expect(requests == [GsUsbBreq.hostFormat.rawValue, GsUsbBreq.btConst.rawValue])
+    // And it is not retried: the feature word will say the same next time.
+    #expect(await transport.openAttempts == 1)
+    #expect(clock.recordedSleeps.isEmpty)
+}
+
+/// The data phase has its own segment limits and the arbitration phase's are
+/// not a substitute, so a CAN FD device that will not report them cannot have
+/// a data bitrate solved at all.
+@Test func canFDIsRefusedWhenTheDataPhaseLimitsCannotBeRead() async throws {
+    let transport = ScriptedUsbTransport(sessions: [
+        session(features: [.listenOnly, .canFD]),
+    ])
+    let clock = GsUsbVirtualClock()
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000)),
+        backoff: GsUsbBackoffPolicy(delays: [.seconds(1)]),
+        clock: clock
+    )
+    let states = device.states
+
+    await device.start()
+    let reason = await waitForDisconnect(states)
+    await device.stop()
+
+    #expect(reason.contains("data-phase bit-timing limits"))
     let requests = await transport.controlExchanges.map(\.request.request)
     #expect(requests == [GsUsbBreq.hostFormat.rawValue, GsUsbBreq.btConst.rawValue])
     #expect(await transport.openAttempts == 1)
     #expect(clock.recordedSleeps.isEmpty)
+}
+
+/// Being *able* to do CAN FD is not a reason to refuse an adapter, which is
+/// what this driver used to do. A classical connection to an FD-capable
+/// adapter sends no `DATA_BITTIMING` and leaves `GS_CAN_MODE_FD` clear, which
+/// is what keeps the controller classical.
+@Test func anFDCapableAdapterRunsClassicalWhenClassicalIsWhatWasAskedFor() async throws {
+    let transport = ScriptedUsbTransport(sessions: [session(features: fdFeatures)])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(transport, consumer: collector, clock: GsUsbSystemClock())
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+    await device.stop()
+
+    let exchanges = await transport.controlExchanges
+    #expect(exchanges.map(\.request.request) == [
+        GsUsbBreq.hostFormat.rawValue,
+        GsUsbBreq.btConst.rawValue,
+        GsUsbBreq.bittiming.rawValue,
+        GsUsbBreq.mode.rawValue,
+    ])
+    #expect(!GsCanFeature(rawValue: 0x0000_1019).contains(.canFD))
+    #expect(modePayloads(exchanges) == [GsDeviceMode(
+        mode: .start, flags: [.listenOnly, .oneShot, .hardwareTimestamp, .berrReporting]
+    ).encoded()])
+    #expect(await device.sourceDescription.contains("500k "))
+    #expect(!(await device.sourceDescription.contains("fd")))
 }
 
 @Test func aFrameOnANonZeroChannelIsRefusedRatherThanMerged() async throws {
@@ -1114,4 +1244,437 @@ private func transmittingTransport(
         mode: .start, flags: GsCanFeature(rawValue: 0x0000_1010)
     ).encoded()])
     await withoutOneShot.stop()
+}
+
+// MARK: - CAN FD
+
+/// The CAN FD handshake, asserted as the literal transfer sequence and the
+/// literal `MODE` flag word. Two transfers are added and both have to land in
+/// the right place: `BT_CONST_EXT` while nothing is configured yet, and
+/// `DATA_BITTIMING` after the arbitration phase and before `MODE`.
+@Test func theCanFDHandshakeAddsTheExtendedConstantsAndTheDataBittiming() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession()])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000)),
+        clock: GsUsbSystemClock()
+    )
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+    await device.stop()
+
+    let exchanges = await transport.controlExchanges
+    #expect(exchanges.map(\.request.request) == [
+        GsUsbBreq.hostFormat.rawValue,
+        GsUsbBreq.btConst.rawValue,
+        GsUsbBreq.btConstExt.rawValue,
+        GsUsbBreq.bittiming.rawValue,
+        GsUsbBreq.dataBittiming.rawValue,
+        GsUsbBreq.mode.rawValue,
+    ])
+
+    // BT_CONST_EXT: a vendor IN for the whole 72-byte struct.
+    #expect(exchanges[2].request.bmRequestType == 0xC1)
+    #expect(exchanges[2].request.length == UInt16(GsDeviceBtConstExtended.byteCount))
+
+    // The two phases are solved against their own limits, so the payloads are
+    // different solutions and not the same one sent twice.
+    let extended = extendedConstants(features: fdFeatures)
+    let arbitration = try BitTiming.solve(bitrate: 500_000, constants: extended.arbitration)
+    let dataPhase = try BitTiming.solve(bitrate: 2_000_000, constants: extended.dataPhase)
+    #expect(exchanges[3].payload == arbitration.bittiming.encoded())
+    #expect(exchanges[4].payload == dataPhase.bittiming.encoded())
+    #expect(exchanges[3].payload != exchanges[4].payload)
+    #expect(exchanges[4].request.length == UInt16(GsDeviceBittiming.byteCount))
+
+    // MODE: listen-only | one-shot | hw-timestamp | FD | berr-reporting.
+    // `GS_CAN_MODE_FD` shares bit 8 with `GS_CAN_FEATURE_FD`.
+    #expect(exchanges[5].payload == GsDeviceMode(
+        mode: .start, flags: GsCanFeature(rawValue: 0x0000_1119)
+    ).encoded())
+    #expect(exchanges[5].payload == [0x01, 0x00, 0x00, 0x00, 0x19, 0x11, 0x00, 0x00])
+}
+
+/// Same reasoning as `aReconnectReappliesListenOnly`: the flag word is
+/// re-derived on every attempt, so a cable bounce cannot bring the link back
+/// as classical CAN and start dropping every FD frame on the bus.
+@Test func aReconnectReappliesCanFD() async throws {
+    let frame = hostFrameBytes(
+        rawCanID: 0x240, data: [UInt8](repeating: 0x11, count: 16),
+        flags: .canFD, timestampMicroseconds: 1_000
+    )
+    let transport = ScriptedUsbTransport(sessions: [
+        fdSession(bulkReads: [.payload(frame), .failure(.deviceRemoved)]),
+        fdSession(bulkReads: [.payload(frame)]),
+    ])
+    let clock = GsUsbVirtualClock()
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000)),
+        backoff: GsUsbBackoffPolicy(delays: [.seconds(1)]),
+        clock: clock
+    )
+    var iterator = collector.frames.makeAsyncIterator()
+
+    await device.start()
+    _ = await iterator.next()
+    _ = await iterator.next()
+    await device.stop()
+
+    #expect(await transport.openAttempts == 2)
+    let expected = GsDeviceMode(
+        mode: .start, flags: GsCanFeature(rawValue: 0x0000_1119)
+    ).encoded()
+    #expect(await modePayloads(transport.controlExchanges) == [expected, expected])
+    // And the data phase is reapplied too, not only configured once.
+    let requests = await transport.controlExchanges.map(\.request.request)
+    #expect(requests.filter { $0 == GsUsbBreq.dataBittiming.rawValue }.count == 2)
+}
+
+/// The read loop cannot use a fixed stride on a CAN FD link, because the
+/// firmware sizes each frame from its own FD flag. Both of these arrive in one
+/// bulk transfer, and finding the second one requires having read the first
+/// one's flags.
+@Test func aSingleTransferCarryingBothFrameFormatsIsCutUpCorrectly() async throws {
+    let classical = hostFrameBytes(
+        rawCanID: 0x100, data: [0x01, 0x02], timestampMicroseconds: 10
+    )
+    let fd = hostFrameBytes(
+        rawCanID: 0x200, data: [UInt8](repeating: 0xAB, count: 48),
+        flags: [.canFD, .bitRateSwitch], timestampMicroseconds: 20
+    )
+    let errorStateIndicated = hostFrameBytes(
+        rawCanID: 0x300, data: [],
+        flags: [.canFD, .errorStateIndicator], timestampMicroseconds: 30
+    )
+    #expect(classical.count == 24)
+    #expect(fd.count == 80)
+    #expect(errorStateIndicated.count == 80)
+
+    let transport = ScriptedUsbTransport(sessions: [
+        fdSession(bulkReads: [.payload(classical + fd + errorStateIndicated)]),
+    ])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000))
+    )
+    var iterator = collector.frames.makeAsyncIterator()
+
+    await device.start()
+    let first = await iterator.next()
+    let second = await iterator.next()
+    let third = await iterator.next()
+    await device.stop()
+
+    #expect(first?.canID == 0x100)
+    #expect(first?.fd == false)
+    #expect(first?.data == [0x01, 0x02])
+
+    #expect(second?.canID == 0x200)
+    #expect(second?.fd == true)
+    #expect(second?.bitRateSwitch == true)
+    #expect(second?.errorStateIndicator == false)
+    #expect(second?.data == [UInt8](repeating: 0xAB, count: 48))
+
+    #expect(third?.canID == 0x300)
+    #expect(third?.fd == true)
+    #expect(third?.bitRateSwitch == false)
+    #expect(third?.errorStateIndicator == true)
+    #expect(third?.data.isEmpty == true)
+
+    // Three whole frames out of one buffer, with nothing left over.
+    let statistics = await device.currentStatistics()
+    #expect(statistics.framesReceived == 3)
+    #expect(statistics.decodeFailures == 0)
+    // Their device timestamps are distinct, which they would not be if the
+    // timestamp word had been read at the wrong offset.
+    #expect(first?.timestampNs != second?.timestampNs)
+    #expect(second?.timestampNs != third?.timestampNs)
+}
+
+/// A CAN FD frame whose header says 80 bytes and whose buffer holds fewer is
+/// counted, not guessed at. The frames ahead of it in the buffer were each
+/// described by their own header and still stand.
+@Test func aTruncatedCanFDFrameIsCountedWithoutLosingTheFramesBeforeIt() async throws {
+    let good = hostFrameBytes(
+        rawCanID: 0x100, data: [0x01], timestampMicroseconds: 10
+    )
+    let truncated = hostFrameBytes(
+        rawCanID: 0x200, data: [UInt8](repeating: 0x7E, count: 64),
+        flags: .canFD, timestampMicroseconds: 20
+    ).prefix(40)
+
+    let transport = ScriptedUsbTransport(sessions: [
+        fdSession(bulkReads: [.payload(good + truncated)]),
+    ])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 2_000_000))
+    )
+    var iterator = collector.frames.makeAsyncIterator()
+
+    await device.start()
+    let first = await iterator.next()
+    await device.stop()
+
+    #expect(first?.canID == 0x100)
+    let statistics = await device.currentStatistics()
+    #expect(statistics.framesReceived == 1)
+    #expect(statistics.decodeFailures == 1)
+}
+
+/// `send` on a classical connection will not quietly truncate a 64-byte
+/// payload into an 8-byte classical frame, for the same reason it will not
+/// reconfigure a listen-only controller to honour a transmit.
+@Test func aCanFDFrameIsRefusedOnAClassicalConnection() async throws {
+    let transport = transmittingTransport()
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(busAccess: .busActive),
+        clock: GsUsbSystemClock()
+    )
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+
+    await #expect(throws: GsUsbTransmitError.canFDNotEnabled) {
+        try await device.send(GsUsbOutboundFrame(
+            canID: 0x240, fd: true, data: [UInt8](repeating: 0x01, count: 64)
+        ))
+    }
+    await device.stop()
+
+    #expect(await transport.bulkWrites.isEmpty)
+    #expect(await device.currentStatistics().framesTransmitted == 0)
+}
+
+@Test func theCanFDRefusalNamesTheWayOut() {
+    let message = "\(GsUsbTransmitError.canFDNotEnabled)"
+
+    #expect(message.contains("classical CAN"))
+    #expect(message.contains("frameFormat"))
+    #expect(message.contains("reconnect"))
+}
+
+/// The echo is the only transmit confirmation there is, and on a CAN FD link
+/// it comes back in the 80-byte layout. Both directions have to agree on the
+/// size or the send never resolves.
+@Test func aCanFDSendResolvesOnItsEchoAndGoesOutInTheEightyByteLayout() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession(echoesWrites: true)])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(
+            busAccess: .busActive, frameFormat: .canFD(dataBitrate: 2_000_000)
+        ),
+        clock: GsUsbSystemClock()
+    )
+    var iterator = collector.frames.makeAsyncIterator()
+    let states = device.states
+    let payload = (0..<64).map { UInt8($0) }
+
+    await device.start()
+    await waitForConnected(states)
+    try await device.send(GsUsbOutboundFrame(
+        canID: 0x240, fd: true, bitRateSwitch: true, data: payload
+    ))
+
+    let echoed = await iterator.next()
+    await device.stop()
+
+    let writes = await transport.bulkWrites
+    #expect(writes.count == 1)
+    #expect(writes.first?.count == 80)
+    // DLC 15 and the FD plus BRS flags, written where the firmware reads them.
+    #expect(writes.first?[8] == 15)
+    #expect(writes.first?[GsHostFrame.flagsByteOffset]
+        == GsHostFrameFlags([.canFD, .bitRateSwitch]).rawValue)
+
+    #expect(echoed?.tx == true)
+    #expect(echoed?.fd == true)
+    #expect(echoed?.bitRateSwitch == true)
+    #expect(echoed?.data == payload)
+    #expect(await device.currentStatistics().framesTransmitted == 1)
+}
+
+/// A classical frame on a CAN FD link stays the 24-byte struct: the device
+/// sizes what it reads from the FD flag in these very bytes, and echoes it
+/// back at that same size.
+@Test func aClassicalFrameOnACanFDConnectionKeepsTheClassicalLayout() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession(echoesWrites: true)])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(
+            busAccess: .busActive, frameFormat: .canFD(dataBitrate: 2_000_000)
+        ),
+        clock: GsUsbSystemClock()
+    )
+    var iterator = collector.frames.makeAsyncIterator()
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+    try await device.send(GsUsbOutboundFrame(canID: 0x240, data: [0xDE, 0xAD]))
+
+    let echoed = await iterator.next()
+    await device.stop()
+
+    #expect(await transport.bulkWrites.first?.count == 24)
+    #expect(echoed?.fd == false)
+    #expect(echoed?.data == [0xDE, 0xAD])
+}
+
+/// CAN FD's lengths are not contiguous, and padding 9 bytes up to 12 would put
+/// three bytes on the bus that the caller never wrote.
+@Test func aCanFDPayloadNoDlcCanExpressIsRefusedRatherThanPadded() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession(echoesWrites: true)])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(
+            busAccess: .busActive, frameFormat: .canFD(dataBitrate: 2_000_000)
+        ),
+        clock: GsUsbSystemClock()
+    )
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+
+    await #expect(throws: GsUsbTransmitError.self) {
+        try await device.send(GsUsbOutboundFrame(
+            canID: 0x240, fd: true, data: [UInt8](repeating: 0x01, count: 9)
+        ))
+    }
+    // CAN FD has no remote-request frame to encode.
+    await #expect(throws: GsUsbTransmitError.self) {
+        try await device.send(GsUsbOutboundFrame(canID: 0x240, rtr: true, fd: true))
+    }
+    await device.stop()
+
+    #expect(await transport.bulkWrites.isEmpty)
+    // A refused frame must not retire one of the ten transmit slots.
+    #expect(await device.currentStatistics().framesTransmitted == 0)
+    try await confirmAllSlotsAreStillAvailable(options: GsUsbOptions(
+        busAccess: .busActive, frameFormat: .canFD(dataBitrate: 2_000_000)
+    ))
+}
+
+/// Ten concurrent sends only complete if every slot a refused frame touched
+/// was handed back. Run against a fresh device so this is a statement about
+/// the pool and not about the previous test's bookkeeping.
+private func confirmAllSlotsAreStillAvailable(options: GsUsbOptions) async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession(echoesWrites: true)])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport, consumer: collector, options: options, clock: GsUsbSystemClock()
+    )
+    let states = device.states
+    await device.start()
+    await waitForConnected(states)
+
+    for _ in 0..<GsUsbDevice.maxFramesInFlight {
+        _ = try? await device.send(GsUsbOutboundFrame(
+            canID: 0x240, fd: true, data: [UInt8](repeating: 0x01, count: 9)
+        ))
+    }
+    try await device.send(GsUsbOutboundFrame(
+        canID: 0x241, fd: true, data: [0x01, 0x02, 0x03, 0x04]
+    ))
+    await device.stop()
+
+    #expect(await transport.bulkWrites.count == 1)
+}
+
+/// §8.4: two captures taken at the same arbitration rate and different data
+/// rates are not the same capture, so the label has to say both.
+@Test func theSourceDescriptionNamesBothRatesOnACanFDConnection() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession()])
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        options: GsUsbOptions(
+            busAccess: .busActive, frameFormat: .canFD(dataBitrate: 2_000_000)
+        ),
+        clock: GsUsbSystemClock()
+    )
+    let states = device.states
+
+    await device.start()
+    await waitForConnected(states)
+    let description = await device.sourceDescription
+    await device.stop()
+
+    #expect(description == "gs_usb SH-C30x #0001 500k/2M fd bus-active hw-ts")
+}
+
+/// The data bitrate goes through the same solver and the same 0.5% ceiling as
+/// the arbitration rate, and an unreachable one is refused rather than retried
+/// against limits that are firmware constants.
+@Test func anUnreachableDataBitrateIsRefusedAndNamesTheAchievedRate() async throws {
+    let transport = ScriptedUsbTransport(sessions: [fdSession()])
+    let clock = GsUsbVirtualClock()
+    let collector = CollectingFrameConsumer()
+    let device = makeDevice(
+        transport,
+        consumer: collector,
+        // 80 MHz over 3 Mbit/s is 26.67 quanta: no exact solution, and the
+        // closest is further off than the ceiling allows.
+        options: GsUsbOptions(frameFormat: .canFD(dataBitrate: 3_000_000)),
+        backoff: GsUsbBackoffPolicy(delays: [.seconds(1)]),
+        clock: clock
+    )
+    let states = device.states
+
+    await device.start()
+    let reason = await waitForDisconnect(states)
+    await device.stop()
+
+    #expect(reason.contains("3000000 bit/s is not reachable"))
+    // Refused with the arbitration phase still unconfigured: both solutions
+    // are computed before either is sent.
+    let requests = await transport.controlExchanges.map(\.request.request)
+    #expect(requests == [
+        GsUsbBreq.hostFormat.rawValue,
+        GsUsbBreq.btConst.rawValue,
+        GsUsbBreq.btConstExt.rawValue,
+    ])
+    #expect(await transport.openAttempts == 1)
+    #expect(clock.recordedSleeps.isEmpty)
+}
+
+@Test func theFrameFormatOptionCannotExpressCanFDWithoutADataBitrate() {
+    #expect(GsUsbOptions().frameFormat == .classical)
+    #expect(GsUsbOptions().canFD == false)
+    #expect(GsUsbOptions.FrameFormat.classical.dataBitrate == nil)
+
+    let fd = GsUsbOptions.FrameFormat.canFD(dataBitrate: 2_000_000)
+    #expect(fd.isCanFD)
+    #expect(fd.dataBitrate == 2_000_000)
+    // The flag word follows from the option, not from the feature bit, so a
+    // reconnect cannot drop it.
+    #expect(GsUsbDevice.modeFlags(
+        options: GsUsbOptions(frameFormat: fd), features: fdFeatures
+    ).contains(.canFD))
+    #expect(!GsUsbDevice.modeFlags(
+        options: GsUsbOptions(), features: fdFeatures
+    ).contains(.canFD))
 }
