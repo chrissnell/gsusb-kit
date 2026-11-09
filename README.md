@@ -1,61 +1,64 @@
 # GSUSBKit
 
-Talk to a CAN bus from your Mac in Swift, using a cheap USB adapter and no
-kernel extension.
+A Swift driver for gs_usb CAN adapters on macOS. No kernel extension, no
+entitlement, no SocketCAN.
 
 Pulled out of [canopener](https://github.com/chrissnell/canopener), where it
 runs against a live vehicle bus.
 
-## If you've never touched CAN before
+## What gs_usb is, if you've only met it as a Linux module
 
-CAN is the network inside your car. Also most motorcycles, boats, tractors and
-factory equipment. It's two wires, and everything on it — engine controller,
-dashboard, ABS — broadcasts short messages called *frames*. A frame is an ID
-(up to 29 bits, says what the message is) plus up to 8 bytes of data. There's
-no addressing and no master. Everyone shouts, everyone hears everything.
+`gs_usb` is the USB protocol spoken by the
+[candleLight](https://github.com/candle-usb/candleLight_fw) firmware, and the
+one Linux's `gs_usb` kernel module drives. It's why so many differently-branded
+dongles are interchangeable: same firmware, different sticker.
+
+macOS ships nothing equivalent — no SocketCAN, no module, no `can0`. So on a
+Mac you talk to the adapter yourself, over raw USB. That's what this is. It
+claims the vendor interface through `IOUSBHost`, runs the gs_usb handshake
+(`HOST_FORMAT` → `BT_CONST` → `BITTIMING` → `MODE`), and hands you decoded,
+timestamped frames. It reconnects on its own, polls controller error state, and
+corrects for the adapter's crystal drift over long captures.
 
 Newer vehicles also run **CAN FD**, which is the same two wires with a bigger
-frame — up to 64 bytes — and an optional trick where the payload is clocked
-out faster than the part of the frame that arbitrates for the bus. This library
-handles both.
+frame — up to 64 bytes — and an optional trick where the payload is clocked out
+faster than the part of the frame that arbitrates for the bus. This library
+handles both; CAN FD adds two transfers to that handshake and stays off until
+you ask for it.
 
-The adapters below are small USB dongles that bridge that bus to your Mac. They
-all speak the same open USB protocol, `gs_usb`, which comes from the
-[candleLight](https://github.com/candle-usb/candleLight_fw) firmware project —
-that's why a handful of differently-branded dongles are interchangeable here.
-
-This library handles the USB side and hands you decoded, timestamped frames.
+Frames arrive through a callback rather than a `can0` socket, and the bit rate
+is negotiated for you from a plain `bitrate:` — there's no `ip link set` step
+and no separate configuration tool.
 
 ## Adapters
 
-| Adapter | CAN | CAN FD | Status |
-|---|---|---|---|
-| DSD TECH SH-C30A | ✓ | — | Tested — this is what development ran against |
-| DSD TECH SH-C31A | ✓ | — | Same firmware, should be identical |
-| CANable | ✓ | — | Expected to work, flashed with candleLight firmware (not the stock slcan firmware) |
-| CANable 2.0 | ✓ | ✓ | Expected to work, candleLight firmware built with CAN FD |
-| candleLight | ✓ | — | Expected to work |
-| CANtact | ✓ | — | Expected to work |
-| CANtact Pro | ✓ | see below | Classical expected to work |
-| budgetcan | ✓ | ✓ | Expected to work |
+Whatever candleLight supports, with the exceptions noted below. Their
+[hardware list](https://github.com/candle-usb/candleLight_fw#candlelight_gsusb)
+is the authoritative one, so there's no second copy of it here.
 
-Only the SH-C30A has actually been on the end of a cable here, and it is a
-classical-CAN adapter — so the CAN FD path is built from the protocol
-definitions and tested against a scripted device, not against FD hardware. If
-you run it on a real FD adapter, I'd like to hear how it goes.
+Development ran against a DSD TECH SH-C30A, and that's the only one that's been
+on the end of a cable here. It's a classical-CAN adapter, which means the CAN FD
+path is built from the protocol definitions and tested against a scripted
+device rather than against FD hardware. The rest run the same firmware and
+should behave the same; if you try one — an FD board especially — let me know
+how it goes.
 
-Got an adapter that isn't listed? Open System Information → USB. If it shows up
-with vendor ID `0x1D50` and product ID `0x606F`, it's running candleLight
-firmware and this library will drive it. Whether that particular build has CAN
-FD compiled in is a separate question, and `swift run gsusbprobe` answers it.
+Already own something and not sure? Open System Information → USB. Vendor ID
+`0x1D50` with product ID `0x606F` means candleLight firmware, and this library
+will drive it. Whether that particular build has CAN FD compiled in is a
+separate question, and `swift run gsusbprobe` answers it.
 
-**Not supported:** adapters with more than one CAN port, and the padding
-workaround some LPC546xx-based adapters need (`GS_CAN_FEATURE_REQ_USB_QUIRK_LPC546XX`).
-The CANtact Pro is an LPC546xx board, and its original firmware also moves the
-data-bitrate request to a different `bRequest` than candleLight uses, so CAN FD
-on a CANtact Pro running firmware v2 or earlier will not work. Multi-port
-adapters are refused during the connect handshake rather than half-configured
-and hoped for; the quirk is simply not implemented.
+**Single channel only.** A frame arriving on any channel but the first is an
+error rather than something quietly folded in with the rest, and a multi-port
+adapter is refused during the handshake rather than half-configured and hoped
+for.
+
+**Two firmware quirks are not implemented**, and both are refusals rather than
+surprises: the padding workaround some LPC546xx-based adapters need
+(`GS_CAN_FEATURE_REQ_USB_QUIRK_LPC546XX`), and the CANtact Pro's relocated
+data-bitrate request. The CANtact Pro is an LPC546xx board whose original
+firmware moves that request to a different `bRequest` than candleLight uses, so
+CAN FD on a CANtact Pro running firmware v2 or earlier will not work.
 
 ## Requirements
 
@@ -109,23 +112,14 @@ await device.stop()
 
 ## It can't transmit unless you ask it to
 
-By default this library sets the adapter up so it is *physically incapable* of
-affecting the bus. That's worth explaining, because it's not just a safety flag
-somebody added.
+`GsUsbOptions` defaults to `busAccess: .listenOnly`, which sets
+`GS_CAN_FEATURE_LISTEN_ONLY` — the controller holds TX recessive, ACKs nothing,
+raises no error frames and never retransmits.
 
-On CAN, acknowledgement is part of the wire protocol. Every controller that
-hears a valid frame yanks the bus low to say "got it" — that's not optional
-politeness, it's how the protocol works. And if a controller doesn't like what
-it sees, it transmits an error flag that deliberately corrupts that frame for
-*everyone* on the bus. So a CAN adapter that comes up in normal mode is already
-participating the instant you plug it in. On a car that's actually running,
-that's a real way to cause trouble.
-
-Listen-only mode puts the controller in a state where it never drives the wires
-at all. No acknowledgements, no error frames, no retransmissions. You see
-everything; the bus can't see you.
-
-That's the default:
+The default is deliberate, because the alternative isn't passive. An adapter
+started as a normal node is a full participant from the first frame it hears —
+ACKing traffic and flagging errors on a bus that may be in a moving vehicle.
+Going live should be something you typed on purpose:
 
 ```swift
 GsUsbOptions(bitrate: 500_000)              // listen-only, silent
@@ -338,3 +332,7 @@ Doc comments here cite section numbers from canopener's design document, which
 is where the behaviour was originally argued out and which doesn't live in this
 repo. Wherever the reasoning matters it's written out inline too, so you're not
 missing anything — the citations are just provenance.
+
+## License
+
+BSD 2-Clause — see [LICENSE](LICENSE).
