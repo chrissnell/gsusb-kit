@@ -440,7 +440,8 @@ private func modePayloads(_ exchanges: [ScriptedUsbTransport.ControlExchange]) -
     await device.stop()
 
     #expect(seen.map(\.seq) == [0, 1, 2])
-    #expect(seen.map(\.canID) == [0x240, 0x241, 0x1234_5678 & 0x1FFF_FFFF])
+    let identifiers: [UInt32] = [0x240, 0x241, 0x1234_5678 & 0x1FFF_FFFF]
+    #expect(seen.map(\.canID) == identifiers)
     #expect(seen.map(\.extended) == [false, false, true])
     #expect(seen.map(\.data) == [[0x01], [0x02, 0x03], []])
     #expect(seen.allSatisfy { $0.tx == false })
@@ -1097,10 +1098,10 @@ private func transmittingTransport(
     let lacking = transmittingTransport(
         features: [.listenOnly, .hardwareTimestamp, .getState, .berrReporting]
     )
-    let collector = CollectingFrameConsumer()
+    let otherCollector = CollectingFrameConsumer()
     let withoutOneShot = makeDevice(
         lacking,
-        consumer: collector,
+        consumer: otherCollector,
         options: GsUsbOptions(busAccess: .busActive),
         clock: GsUsbSystemClock()
     )
