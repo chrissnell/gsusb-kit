@@ -27,10 +27,14 @@ public enum GsUsbProtocolError: Error, Equatable, Sendable {
     /// A bulk-IN buffer whose length matches none of `GsHostFrame.Layout`'s
     /// four sizes — 20 and 24 classical, 76 and 80 for CAN FD.
     case unsupportedFrameLength(Int)
-    /// `can_dlc` outside what the frame's own `GS_CAN_FLAG_FD` bit permits:
-    /// above 8 on a classical frame, above 15 on a CAN FD one. Rejected rather
-    /// than clamped silently, because a DLC that cannot be honoured means the
-    /// layout assumption is wrong and the payload would be invented.
+    /// A `can_dlc` above 15 on decode, or a transmit payload longer than
+    /// classical CAN's eight bytes.
+    ///
+    /// 15 is the ceiling in both frame formats because `can_dlc` is a four-bit
+    /// field; a byte above it is not a DLC the firmware could have written, so
+    /// the layout assumption is wrong and any payload read out would be
+    /// invented. Classical codes 9–15 are *not* an error — they mean eight
+    /// bytes, as upstream's `can_cc_dlc2len` has them.
     case invalidDataLength(UInt8)
     /// `GS_CAN_FLAG_FD` and the buffer length disagree: the flag set on a
     /// buffer only wide enough for the classical 8-byte data field, or clear on
@@ -660,10 +664,10 @@ public struct GsHostFrame: Sendable, Equatable {
     public let channel: UInt8
     public let flags: GsHostFrameFlags
     public let reserved: UInt8
-    /// Payload truncated to the length `canDLC` means — the DLC itself on a
-    /// classical frame, `canFDDataLengths[canDLC]` on a CAN FD one. The wire
-    /// field is the full 8 or 64 bytes either way; what lies past the declared
-    /// length is stale firmware buffer, not bus data.
+    /// Payload truncated to the length `canDLC` means — the DLC itself capped
+    /// at 8 on a classical frame, `canFDDataLengths[canDLC]` on a CAN FD one.
+    /// The wire field is the full 8 or 64 bytes either way; what lies past the
+    /// declared length is stale firmware buffer, not bus data.
     public let data: [UInt8]
     /// Device microsecond counter, or `nil` on a layout that carries none.
     /// `TimestampMapper` is what turns this into a `Frame.timestampNs`.
@@ -731,10 +735,16 @@ public struct GsHostFrame: Sendable, Equatable {
             }
             length = resolved
         } else {
-            guard dlc <= 8 else {
+            // Classical CAN's payload stops at eight bytes but its DLC codes
+            // run to 15, and 9–15 all mean exactly eight — `can_cc_dlc2len`
+            // upstream is `min(dlc, 8)`. Those codes are legal on the wire, so
+            // clamping here is what keeps ordinary traffic from being counted
+            // as a decode failure. Above 15 is not a four-bit DLC at all and
+            // stays a refusal.
+            guard dlc <= 15 else {
                 throw GsUsbProtocolError.invalidDataLength(dlc)
             }
-            length = Int(dlc)
+            length = min(Int(dlc), 8)
         }
         canDLC = dlc
         data = Array(cursor.readBytes(layout.dataFieldByteCount).prefix(length))

@@ -639,14 +639,30 @@ private let esiFlag: UInt8 = 1 << 3
     #expect(frame.data.isEmpty)
 }
 
-/// Classical CAN tops out at 8. A DLC above that means the layout assumption
-/// is wrong, and clamping silently would hide that.
-@Test func hostFrameRejectsADataLengthAboveEight() {
-    #expect(throws: GsUsbProtocolError.invalidDataLength(9)) {
-        _ = try GsHostFrame(decoding: hostFrameBytes(rawCanID: 0x100, dlc: 9, data: []))
+/// Classical CAN's payload tops out at eight bytes, but its DLC *codes* run to
+/// 15 and every code above 8 still means exactly eight bytes — the length is
+/// `min(dlc, 8)`, which is what `can_cc_dlc2len` does upstream. Those codes are
+/// legal on the wire and do turn up, so refusing them would count ordinary
+/// traffic as a decode failure. The code itself is preserved in `canDLC`.
+@Test func aClassicalDlcAboveEightMeansEightBytesRatherThanBeingRefused() throws {
+    let payload: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]
+    for dlc: UInt8 in 9...15 {
+        let frame = try GsHostFrame(decoding: hostFrameBytes(
+            rawCanID: 0x100, dlc: dlc, data: payload
+        ))
+        #expect(frame.canDLC == dlc)
+        #expect(frame.data == payload)
     }
-    #expect(throws: GsUsbProtocolError.invalidDataLength(15)) {
-        _ = try GsHostFrame(decoding: hostFrameBytes(rawCanID: 0x100, dlc: 15, data: []))
+}
+
+/// A four-bit field cannot hold 16, so this is corruption rather than one more
+/// code that means eight bytes — the classical counterpart of
+/// `aCanFDFrameRejectsADlcAboveFifteen`.
+@Test func aClassicalFrameRejectsADlcAboveFifteen() {
+    var bytes = hostFrameBytes(rawCanID: 0x100, dlc: 0, data: [])
+    bytes[8] = 16
+    #expect(throws: GsUsbProtocolError.invalidDataLength(16)) {
+        _ = try GsHostFrame(decoding: bytes)
     }
 }
 

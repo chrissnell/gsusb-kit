@@ -635,9 +635,11 @@ private func modePayloads(_ exchanges: [ScriptedUsbTransport.ControlExchange]) -
 }
 
 @Test func undecodableBulkDataIsCountedRatherThanSilentlyDropped() async throws {
-    // A dlc of 9: plausible length, impossible payload.
+    // A dlc of 16 does not fit the four-bit field, so no firmware wrote it.
+    // Not 9–15: those are legal classical codes meaning eight bytes, and they
+    // decode rather than counting here.
     var badDLC = hostFrameBytes(rawCanID: 0x240)
-    badDLC[8] = 9
+    badDLC[8] = 16
 
     let transport = ScriptedUsbTransport(sessions: [
         session(features: [.listenOnly], bulkReads: [
