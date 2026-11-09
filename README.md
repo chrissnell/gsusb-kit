@@ -240,3 +240,7 @@ Doc comments here cite section numbers from canopener's design document, which
 is where the behaviour was originally argued out and which doesn't live in this
 repo. Wherever the reasoning matters it's written out inline too, so you're not
 missing anything — the citations are just provenance.
+
+## License
+
+BSD 2-Clause — see [LICENSE](LICENSE).
