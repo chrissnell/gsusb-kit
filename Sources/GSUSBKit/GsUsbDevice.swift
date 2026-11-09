@@ -1058,6 +1058,15 @@ public actor GsUsbDevice {
                 // flag is refused instead and the fixed classical stride, which
                 // is the only stride this connection can produce, carries the
                 // walk to the next frame.
+                //
+                // Dropped rather than masked, which costs a TX echo that lands
+                // here its `sendTimeout` before `send` reports
+                // `notAcknowledged`. That is the safe direction: a frame with
+                // one byte known corrupt has no trustworthy `echo_id` either,
+                // and `handleEcho` admits any claimed slot — every claimed slot
+                // has a frame genuinely in flight, so a corrupt id that happens
+                // to name one would confirm a transmit that may never have
+                // reached the bus. A late "don't know" beats a prompt "sent".
                 if flags.contains(.canFD), !options.canFD {
                     let classical = GsHostFrame.Layout(
                         canFD: false, timestamped: framesAreTimestamped
